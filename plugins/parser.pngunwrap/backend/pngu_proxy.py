@@ -467,18 +467,16 @@ def _replace_uri(line, new_uri):
     return line[:i + 5] + new_uri + line[j:]
 
 
-def _serve_bytes(handler, blob, ctype, allow_range=True):
-    """统一的字节输出：支持 HEAD / Range(206) / 正确 Content-Length。
+def _range_of(blob, rng, allow_range=True):
+    """解析 Range 头，返回 (status, body, extra_headers)。
 
-    注意顺序：必须先 send_response（发状态行），再 send_header，否则状态行
-    会被塞到响应头后面，客户端直接 BadStatusLine。
+    抽成纯函数是为了让「独立 HTTP 服务」和「挂到平台 FastAPI 上的 ASGI 路由」
+    共用同一套切片逻辑 —— 两条出口的 Range/206/Content-Length 行为必须一致。
     """
     total = len(blob)
-    rng = handler.headers.get("Range") or ""
-
     start, end = 0, total - 1
     partial = False
-    if allow_range and rng.startswith("bytes=") and total > 0:
+    if allow_range and rng and rng.startswith("bytes=") and total > 0:
         spec = rng[6:].split(",")[0].strip()
         try:
             if spec.startswith("-"):
@@ -495,21 +493,143 @@ def _serve_bytes(handler, blob, ctype, allow_range=True):
             start, end, partial = 0, total - 1, False
 
     body = blob[start:end + 1] if partial else blob
-
-    handler.send_response(206 if partial else 200)
-    handler.send_header("Content-Type", ctype)
-    handler.send_header("Accept-Ranges", "bytes" if allow_range else "none")
-    handler.send_header("Cache-Control", "no-store")
-    handler.send_header("Content-Length", str(len(body)))
+    hdrs = {
+        "Accept-Ranges": "bytes" if allow_range else "none",
+        "Content-Length": str(len(body)),
+        "Cache-Control": "no-store",
+    }
     if partial:
-        handler.send_header(
-            "Content-Range", "bytes %d-%d/%d" % (start, end, total))
+        hdrs["Content-Range"] = "bytes %d-%d/%d" % (start, end, total)
+    return (206 if partial else 200), body, hdrs
+
+
+def _serve_bytes(handler, blob, ctype, allow_range=True, code=200):
+    """统一的字节输出：支持 HEAD / Range(206) / 正确 Content-Length。
+
+    注意顺序：必须先 send_response（发状态行），再 send_header，否则状态行
+    会被塞到响应头后面，客户端直接 BadStatusLine。
+    """
+    st, body, hdrs = _range_of(blob, handler.headers.get("Range") or "",
+                               allow_range)
+    if st != 206:
+        st = code
+    handler.send_response(st)
+    handler.send_header("Content-Type", ctype)
+    for k, v in hdrs.items():
+        handler.send_header(k, v)
     handler.end_headers()
     if handler.command != "HEAD":
         try:
             handler.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+
+def handle_path(proxy, path, query="", prefix=""):
+    """把 HTTP 路径翻译成 (status, content_type, body)。
+
+    独立端口（BaseHTTPRequestHandler）和「挂到平台 8521 上的 ASGI 路由」
+    共用这一个函数，保证两条出口的行为完全一致 —— 否则很容易出现
+    「18521 能播、8521 不能播」这种只在一条路上复现的怪问题。
+    """
+    parsed = urllib.parse.urlsplit(path)
+    parts = [p for p in parsed.path.split("/") if p]
+    q = urllib.parse.parse_qs(parsed.query or query)
+
+    if not parts:
+        return 200, "application/json; charset=utf-8", json.dumps(
+            {"ok": True, "service": "pngunwrap"}, ensure_ascii=False).encode()
+
+    head = parts[0]
+    if not head.startswith("__"):
+        DIAG.bump("hit_" + head)
+
+    def _json(obj, code=200):
+        return code, "application/json; charset=utf-8", json.dumps(
+            obj, ensure_ascii=False, indent=2).encode("utf-8")
+
+    if head == "__health":
+        return _json(proxy_health(proxy))
+
+    if head == "__diag":
+        return _json({"health": proxy_health(proxy), "diag": DIAG.snapshot()})
+
+    def _register(src, ref=""):
+        """登记一条源并返回会话；失败抛异常由上层转成 502。"""
+        tok = _b64e(src)
+        sess = proxy.session(tok)
+        if not sess:
+            proxy.register(src, referer=ref, prefix=prefix, token=tok)
+            sess = proxy.session(tok)
+        return sess
+
+    if head == "__test":
+        src = (q.get("url") or [""])[0].strip()
+        if not src:
+            return _json({"ok": False, "error": "用法：/__test?url=<m3u8 地址>"}, 400)
+        try:
+            sess = _register(src, (q.get("ref") or [""])[0].strip())
+        except Exception as e:                      # noqa: BLE001
+            return _json({"ok": False, "error": str(e)[:300]}, 502)
+        segs = list(sess.segments)
+        return _json({
+            "ok": True,
+            "playlist_url": "%s/hls/u/%s.m3u8" % (prefix.rstrip("/"), sess.token),
+            "segments": len(segs),
+            "first_segment_url": segs[0] if segs else "",
+            "next": "先打开 playlist_url 确认分片地址已被改写成本服务，"
+                    "再打开 first_segment_url 确认返回的是 TS 而不是 PNG",
+        })
+
+    # 自包含入口：源地址 base64 编在路径里，不依赖任何登记记录
+    if head == "hls" and len(parts) >= 3 and parts[1] == "u":
+        raw = parts[2].split(".")[0]
+        src = _b64d(raw)
+        if not src.lower().startswith(("http://", "https://")):
+            return _json({"ok": False,
+                          "error": "路径里的源地址解不出来（应为 base64url 编码的 "
+                                   "m3u8 地址）"}, 400)
+        sess = proxy.session(raw)
+        if not sess:
+            try:
+                # 默认**不发 Referer**：icve/douyinbit 这类站点的防盗链恰恰是
+                # 「有 Referer 反而 403」，而 curl 默认不发 Referer 能直取。
+                proxy.register(src, referer=(q.get("ref") or [""])[0].strip(),
+                               prefix=prefix, token=raw)
+            except Exception as e:                  # noqa: BLE001
+                return _json({"ok": False, "error": str(e)[:300], "src": src}, 502)
+            sess = proxy.session(raw)
+        return (200, "application/vnd.apple.mpegurl",
+                proxy.playlist_bytes(sess, prefix))
+
+    if head == "hls" and len(parts) >= 2:
+        tok = parts[1].split(".")[0]
+        sess = proxy.session(tok)
+        if not sess:
+            return _json({"ok": False, "error": "会话不存在或已过期",
+                          "token": tok}, 404)
+        return (200, "application/vnd.apple.mpegurl",
+                proxy.playlist_bytes(sess, prefix))
+
+    if head == "seg" and len(parts) >= 3:
+        tok, idx = parts[1], parts[2]
+        if tok == "demo":
+            return 200, "video/mp2t", pngu_fetch.demo_segment()
+        sess = proxy.session(tok)
+        if not sess:
+            return _json({"ok": False, "error": "会话不存在或已过期",
+                          "token": tok}, 404)
+        return 200, "video/mp2t", proxy.segment_bytes(sess, int(idx))
+
+    if head == "key" and len(parts) >= 3:
+        tok, idx = parts[1], parts[2]
+        sess = proxy.session(tok)
+        if not sess:
+            return _json({"ok": False, "error": "会话不存在或已过期",
+                          "token": tok}, 404)
+        return 200, "application/octet-stream", proxy.key_bytes(sess, idx)
+
+    return _json({"ok": False, "error": "未知路径 %s" % path}, 404)
 
 
 def _serve_json(handler, obj, code=200):
@@ -544,123 +664,9 @@ def _make_handler(proxy):
 
         def _route(self):
             try:
-                parsed = urllib.parse.urlsplit(self.path)
-                parts = [p for p in parsed.path.split("/") if p]
-                if not parts:
-                    return _serve_json(self, {"ok": True,
-                                              "service": "pngunwrap"}, 200)
-                head = parts[0]
-
-                # 记录真实到达内建服务的请求：平台代理有没有来拉，一眼可见
-                if not head.startswith("__"):
-                    DIAG.bump("hit_" + head)
-
-                if head == "__health":
-                    return _serve_json(self, proxy_health(proxy))
-
-                if head == "__diag":
-                    return _serve_json(self, {"health": proxy_health(proxy),
-                                              "diag": DIAG.snapshot()})
-
-                # 脱离平台自测：/__test?url=<m3u8> 直接建一个会话，
-                # 返回可播放的清单地址，用浏览器就能验证整条剥壳链路。
-                if head == "__test":
-                    q = urllib.parse.parse_qs(parsed.query)
-                    src = (q.get("url") or [""])[0].strip()
-                    if not src:
-                        return _serve_json(self, {
-                            "ok": False,
-                            "error": "用法：/__test?url=<m3u8 地址>",
-                        }, 400)
-                    prefix = _prefix_of(self, proxy)
-                    try:
-                        url = proxy.register(src, referer=src, prefix=prefix)
-                    except Exception as e:          # noqa: BLE001
-                        return _serve_json(self, {"ok": False,
-                                                  "error": str(e)[:300]}, 502)
-                    tok = url.rsplit("/", 1)[-1].split(".")[0]
-                    sess = proxy.session(tok)
-                    segs = list(sess.segments) if sess else []
-                    return _serve_json(self, {
-                        "ok": True,
-                        "playlist_url": url,
-                        "segments": len(segs),
-                        "first_segment_url": segs[0] if segs else "",
-                        "next": "先打开 playlist_url 确认分片地址已被改写成本服务，"
-                                "再打开 first_segment_url 确认返回的是 TS 而不是 PNG",
-                    })
-
-                # 自包含入口：把源 m3u8 地址 base64 编进路径。
-                #   http://<本服务>/hls/u/<b64>.m3u8
-                # 好处是不依赖平台解析链、不依赖任何登记记录，重启即恢复，
-                # 可以直接写进 .strm 文件当播放地址用。
-                if head == "hls" and len(parts) >= 3 and parts[1] == "u":
-                    raw = parts[2].split(".")[0]
-                    src = _b64d(raw)
-                    if not src.lower().startswith(("http://", "https://")):
-                        return _serve_json(self, {
-                            "ok": False,
-                            "error": "路径里的源地址解不出来（应为 base64url 编码的 m3u8 地址）",
-                        }, 400)
-                    prefix = _prefix_of(self, proxy)
-                    sess = proxy.session(raw)
-                    if not sess:
-                        q = urllib.parse.parse_qs(parsed.query)
-                        ref = (q.get("ref") or [""])[0].strip()
-                        try:
-                            # 默认**不发 Referer**：icve/douyinbit 这类站点的
-                            # 防盗链恰恰是「有 Referer 反而 403」，而 curl 默认
-                            # 不发 Referer 能直取。需要 Referer 的站用 ?ref= 指定。
-                            proxy.register(src, referer=ref,
-                                           prefix=prefix, token=raw)
-                        except Exception as e:      # noqa: BLE001
-                            return _serve_json(self, {
-                                "ok": False, "error": str(e)[:300],
-                                "src": src,
-                            }, 502)
-                        sess = proxy.session(raw)
-                    blob = proxy.playlist_bytes(sess, prefix)
-                    return _serve_bytes(
-                        self, blob, "application/vnd.apple.mpegurl")
-
-                if head == "hls" and len(parts) >= 2:
-                    tok = parts[1].split(".")[0]
-                    sess = proxy.session(tok)
-                    if not sess:
-                        return _serve_json(
-                            self, {"ok": False, "error": "会话不存在或已过期",
-                                   "token": tok}, 404)
-                    prefix = _prefix_of(self, proxy)
-                    blob = proxy.playlist_bytes(sess, prefix)
-                    return _serve_bytes(
-                        self, blob, "application/vnd.apple.mpegurl")
-
-                if head == "seg" and len(parts) >= 3:
-                    tok, idx = parts[1], parts[2]
-                    if tok == "demo":
-                        return _serve_bytes(self, pngu_fetch.demo_segment(),
-                                            "video/mp2t")
-                    sess = proxy.session(tok)
-                    if not sess:
-                        return _serve_json(
-                            self, {"ok": False, "error": "会话不存在或已过期",
-                                   "token": tok}, 404)
-                    blob = proxy.segment_bytes(sess, int(idx))
-                    return _serve_bytes(self, blob, "video/mp2t")
-
-                if head == "key" and len(parts) >= 3:
-                    tok, idx = parts[1], parts[2]
-                    sess = proxy.session(tok)
-                    if not sess:
-                        return _serve_json(
-                            self, {"ok": False, "error": "会话不存在或已过期",
-                                   "token": tok}, 404)
-                    return _serve_bytes(self, proxy.key_bytes(sess, idx),
-                                        "application/octet-stream")
-
-                return _serve_json(self, {"ok": False,
-                                          "error": "未知路径 %s" % self.path},
-                                   404)
+                prefix = _prefix_of(self, proxy)
+                code, ctype, blob = handle_path(proxy, self.path, prefix=prefix)
+                _serve_bytes(self, blob, ctype, code=code)
             except Exception as e:                  # noqa: BLE001
                 log.warning("处理 %s 失败：%s", self.path, e)
                 try:

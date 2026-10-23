@@ -69,6 +69,7 @@ except Exception as _e:                             # noqa: BLE001
     ParseResult = ParseStream = _Model
 
 import pngu_fetch
+import pngu_mount
 import pngu_proxy
 
 
@@ -83,6 +84,7 @@ DEFAULTS = {
     "play_quality": "1080",
     "cookie": "",
     "access_mode": "proxy",         # proxy / direct
+    "mount_on_platform": True,      # 挂到平台 8521（推荐），失败自动回退独立端口
     "bind_host": "127.0.0.1",
     "listen_port": "18521",
     "public_base": "",
@@ -140,7 +142,7 @@ def _as_int(v, default, lo=None, hi=None):
 class Plugin(BasePlugin):
     plugin_id = "parser.pngunwrap"
     plugin_name = "PNG 壳分片剥离"
-    plugin_version = "0.2.3"
+    plugin_version = "0.3.0"
 
     def __init__(self):
         self._cfg = dict(DEFAULTS)
@@ -148,6 +150,7 @@ class Plugin(BasePlugin):
         self._disabled = False
         self._seen_sig = set()
         self._last_log = 0.0
+        self._mount_tried = False
 
     # ------------------------------------------------------------ 配置
 
@@ -236,6 +239,13 @@ class Plugin(BasePlugin):
                         default="", secret=True,
                         description="可选；登录态能拿到更高画质。",
                         group="取流"),
+            ConfigField(key="mount_on_platform", label="挂到平台统一端口",
+                        type="boolean", default=True,
+                        description="开启后把剥壳服务挂到 T3FAP 自己的 FastAPI 上，"
+                                    "播放器只访问 8521 的 /api/strm/pngu/... 就能拿到"
+                                    "剥壳后的 TS，不需要端口映射。挂不上会自动回退到"
+                                    "独立端口。",
+                        group="服务"),
             ConfigField(key="access_mode", label="交给平台的方式", type="select",
                         default="proxy",
                         description="proxy（默认，推荐）：平台在容器内自己来拉流，"
@@ -310,6 +320,11 @@ class Plugin(BasePlugin):
         return True
 
     def _shutdown(self):
+        try:
+            pngu_mount.unmount()
+        except Exception as e:                      # noqa: BLE001
+            log.warning("摘除平台路由失败（不影响运行）：%s", e)
+        self._mount_tried = False
         proxy, self._proxy = self._proxy, None
         if proxy:
             try:
@@ -338,6 +353,7 @@ class Plugin(BasePlugin):
                 "source_mode": self._cfg.get("source_mode"),
                 "access_mode": self._cfg.get("access_mode"),
                 "service": proxy_health_of(proxy),
+                "mount": pngu_mount.state(),
                 "wasm": os.path.isfile(wasm),
                 "sdk": _SDK,
                 "diag": pngu_proxy.DIAG.snapshot(),
@@ -536,17 +552,61 @@ class Plugin(BasePlugin):
             raise pngu_fetch.FetchError(
                 "内建服务启动失败（%s:%d）：%s" % (host, port, e))
         self._proxy = proxy
+        self._try_mount(proxy)
         return proxy
+
+    def _try_mount(self, proxy):
+        """尝试把服务挂到平台 8521 上（只试一次，失败不重试也不报错）。
+
+        平台是 FastAPI，插件在同进程里，`app.mount()` 之后播放器直接访问
+        `http://<NAS>:8521/api/strm/pngu/...` 即可，不用额外映射端口。
+        """
+        if self._mount_tried:
+            return
+        self._mount_tried = True
+        if not _as_bool(self._cfg.get("mount_on_platform"), True):
+            log.info("mount_on_platform 已关闭，只用独立端口 %d", proxy.port)
+            return
+        ok, msg = pngu_mount.mount(proxy)
+        if ok:
+            log.info("挂到平台 8521 成功：%s", msg)
+        else:
+            log.info("挂到平台 8521 未成功（回退独立端口 %d）：%s",
+                     proxy.port, msg)
+
+    def _platform_prefix(self, proxy):
+        """挂载成功时返回 8521 上的前缀地址；否则返回空串。
+
+        地址来源优先级：public_base > T3MT_PUBLIC_BASE_URL（平台自己的对外
+        地址环境变量）> 本机局域网 IP + 8521。
+        """
+        if not pngu_mount.state().get("mounted"):
+            return ""
+        public = str(self._cfg.get("public_base") or "").strip().rstrip("/")
+        if public:
+            return public + pngu_mount.PREFIX
+        env = (os.environ.get("T3MT_PUBLIC_BASE_URL")
+               or os.environ.get("T3MT_PUBLIC_URL")
+               or os.environ.get("T3MT_BASE_URL") or "").strip().rstrip("/")
+        if env:
+            return env + pngu_mount.PREFIX
+        ip = pngu_proxy.guess_local_ip()
+        host = ip or "127.0.0.1"
+        return "http://%s:%d%s" % (host, 8521, pngu_mount.PREFIX)
 
     def _client_prefix(self, proxy):
         """返回给平台的「流地址」用的绝对 base。
 
-        优先级：public_base > 绑定地址（非通配）> direct 模式探测本机局域网 IP
-        > 127.0.0.1。
+        优先级：平台内挂载（8521）> public_base > 绑定地址（非通配）
+        > direct 模式探测本机局域网 IP > 127.0.0.1。
         注意这只决定**清单地址本身**；清单里分片的地址由每个请求自己的 Host
         头现场决定（见 pngu_proxy._prefix_of / _render），所以局域网 IP 和
         DDNS 域名可以共用同一份会话。
         """
+        platform = self._platform_prefix(proxy)
+        if platform:
+            return platform
+
         public = str(self._cfg.get("public_base") or "").strip().rstrip("/")
         if public:
             return public
