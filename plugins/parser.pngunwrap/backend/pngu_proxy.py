@@ -111,6 +111,41 @@ class SegmentCache(object):
                     "mb": round(total / 1048576.0, 1)}
 
 
+class DiagLog(object):
+    """环形诊断缓冲：记录平台调用进来的每一次请求，供 /__diag 查看。
+
+    排查「插件到底有没有被调用」靠的就是它 —— 平台上什么都不显示的时候，
+    这里有没有记录就是唯一证据。
+    """
+
+    def __init__(self, maxlen=50):
+        self.maxlen = maxlen
+        self.items = []
+        self.counts = {}
+        self.lock = threading.Lock()
+        self.started = time.time()
+
+    def bump(self, key, n=1):
+        with self.lock:
+            self.counts[key] = self.counts.get(key, 0) + n
+
+    def add(self, kind, data):
+        with self.lock:
+            self.items.append({"t": round(time.time() - self.started, 3),
+                               "ev": kind, "data": data})
+            if len(self.items) > self.maxlen:
+                del self.items[:len(self.items) - self.maxlen]
+
+    def snapshot(self):
+        with self.lock:
+            return {"uptime_s": round(time.time() - self.started, 1),
+                    "counts": dict(self.counts),
+                    "recent": list(self.items[-20:])}
+
+
+DIAG = DiagLog()
+
+
 class HlsProxy(object):
     """插件内建 HTTP 服务（惰性启动，进程内线程）。"""
 
@@ -438,8 +473,16 @@ def _make_handler(proxy):
                                               "service": "pngunwrap"}, 200)
                 head = parts[0]
 
+                # 记录真实到达内建服务的请求：平台代理有没有来拉，一眼可见
+                if not head.startswith("__"):
+                    DIAG.bump("hit_" + head)
+
                 if head == "__health":
                     return _serve_json(self, proxy_health(proxy))
+
+                if head == "__diag":
+                    return _serve_json(self, {"health": proxy_health(proxy),
+                                              "diag": DIAG.snapshot()})
 
                 if head == "hls" and len(parts) >= 2:
                     tok = parts[1].split(".")[0]

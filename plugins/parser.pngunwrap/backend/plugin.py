@@ -13,9 +13,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -69,6 +71,7 @@ import pngu_proxy
 
 DEFAULTS = {
     "enabled": True,
+    "supports_mode": "4k",          # 4k / any（any 仅排查用）
     "source_mode": "auto",          # auto / manual / demo
     "external_m3u8": "",
     "base_url": pngu_fetch.DEFAULT_BASE,
@@ -81,6 +84,15 @@ DEFAULTS = {
     "cache_mb": "64",
     "cache_ttl": "30",
 }
+
+
+def _snap(obj, limit=1500):
+    """把平台传进来的结构压成一行日志 —— 排查就靠它。"""
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str, sort_keys=True)
+    except Exception:                               # noqa: BLE001
+        s = repr(obj)
+    return s[:limit]
 
 
 def _as_bool(v, default=True):
@@ -109,12 +121,14 @@ def _as_int(v, default, lo=None, hi=None):
 class Plugin(BasePlugin):
     plugin_id = "parser.pngunwrap"
     plugin_name = "PNG 壳分片剥离"
-    plugin_version = "0.1.0"
+    plugin_version = "0.2.0"
 
     def __init__(self):
         self._cfg = dict(DEFAULTS)
         self._proxy = None
         self._disabled = False
+        self._seen_sig = set()
+        self._last_log = 0.0
 
     # ------------------------------------------------------------ 配置
 
@@ -137,6 +151,16 @@ class Plugin(BasePlugin):
                         description="关掉后立刻完全让路给原来的 4k 解析插件，"
                                     "不需要卸载。",
                         group="总开关"),
+            ConfigField(key="supports_mode", label="接管范围", type="select",
+                        default="4k",
+                        description="4k = 只接管 4k 影视来源（推荐）；"
+                                    "any = 任何 m3u8 解析请求都接管，"
+                                    "仅用于排查平台是否真的调用了本插件。",
+                        group="总开关",
+                        options=[
+                            {"value": "4k", "label": "只接管 4k 来源"},
+                            {"value": "any", "label": "全部接管（排查用）"},
+                        ]),
             ConfigField(key="source_mode", label="取流模式", type="select",
                         default="auto",
                         description="auto = 用 4k 播放参数自动签名取流；"
@@ -254,17 +278,30 @@ class Plugin(BasePlugin):
         proxy = self._proxy
         details = {
             "enabled": self._enabled(),
+            "supports_mode": self._cfg.get("supports_mode"),
             "source_mode": self._cfg.get("source_mode"),
             "access_mode": self._cfg.get("access_mode"),
             "service": proxy_health_of(proxy),
             "wasm": os.path.isfile(wasm),
             "sdk": _SDK,
+            "diag": pngu_proxy.DIAG.snapshot(),
         }
         if problems:
             return HealthReport(status="warning",
                                 message="；".join(problems), details=details)
         return HealthReport(status="ok",
                             message="PNG 壳剥离已就绪。", details=details)
+
+    def health_score(self):
+        """T3FAP 解析链用它对插件排序/过滤（rules.md §4.6 要求实现）。
+
+        返回 0.0 会被当成不可用直接跳过，所以只要没被关掉就给高分。
+        """
+        if not self._enabled():
+            return 0.0
+        if not _SDK:
+            return 0.3
+        return 0.95
 
     # ------------------------------------------------------------ 协议
 
@@ -273,28 +310,67 @@ class Plugin(BasePlugin):
 
         判定很保守：来源必须是 4k（provider=4k 或地址属于 4k 家族），
         且能拿到播放参数。其余一律放行，退回给别的解析插件。
+
+        每次调用都会留痕（PNGU-supports 日志 + /__diag），因为「插件到底有没有
+        被平台问过」是排查的第一现场。
         """
         if self._disabled or not self._enabled():
+            pngu_proxy.DIAG.bump("supports_skipped")
             return False
+
+        pngu_proxy.DIAG.bump("supports_calls")
+        self._note_target("supports", target)
+
+        mode = str(self._cfg.get("supports_mode") or "4k").lower()
         try:
             if isinstance(target, dict):
+                if mode == "any":
+                    ok = bool(target.get("url") or target.get("page_url")
+                              or target.get("play_url") or target.get("meta"))
+                    pngu_proxy.DIAG.bump("supports_true" if ok
+                                         else "supports_false")
+                    return ok
                 provider = str(target.get("provider") or "").strip().lower()
                 if provider and provider != "4k":
+                    pngu_proxy.DIAG.bump("supports_false")
                     return False
                 meta = target.get("meta") or {}
                 if isinstance(meta, dict):
                     if (meta.get("data_id") and meta.get("secret_key")
                             and meta.get("play_key")):
+                        pngu_proxy.DIAG.bump("supports_true")
                         return True
                     if meta.get("data_id") and meta.get("play_key"):
+                        pngu_proxy.DIAG.bump("supports_true")
                         return True
                 url = str(target.get("url") or target.get("page_url") or "")
-                return self._looks_4k(url)
+                ok = self._looks_4k(url)
+                pngu_proxy.DIAG.bump("supports_true" if ok else "supports_false")
+                return ok
             if isinstance(target, str):
-                return self._looks_4k(target)
+                ok = (mode == "any" and bool(target)) or self._looks_4k(target)
+                pngu_proxy.DIAG.bump("supports_true" if ok else "supports_false")
+                return ok
         except Exception as e:                      # noqa: BLE001
             log.warning("supports 判定异常：%s", e)
+            pngu_proxy.DIAG.add("supports_error", {"error": str(e)[:200]})
+        pngu_proxy.DIAG.bump("supports_false")
         return False
+
+    def _note_target(self, kind, target):
+        """留痕：先塞进环形缓冲，再按「签名去重 + 2 秒节流」打日志。"""
+        sig = _snap(target, 300)
+        now = time.time()
+        try:
+            pngu_proxy.DIAG.add(kind, {"target": _snap(target)})
+        except Exception:                           # noqa: BLE001
+            pass
+        fresh = sig not in self._seen_sig
+        if fresh and len(self._seen_sig) < 40:
+            self._seen_sig.add(sig)
+        if fresh or now - self._last_log > 2.0:
+            self._last_log = now
+            log.info("PNGU-%s 收到：%s", kind, _snap(target))
 
     @staticmethod
     def _looks_4k(url):
@@ -304,13 +380,21 @@ class Plugin(BasePlugin):
         return any(k in u for k in ("4kvms", "nbmovie", "4kys", "4kvm"))
 
     def parse(self, parse_request):
+        pngu_proxy.DIAG.bump("parse_calls")
+        self._note_target("parse", parse_request)
         try:
             return self._parse(parse_request)
         except pngu_fetch.FetchError as e:
+            pngu_proxy.DIAG.bump("parse_fail")
+            pngu_proxy.DIAG.add("parse_fail", {"error": str(e)[:300]})
             return self._fail(str(e), retryable=True)
         except Exception as e:                      # noqa: BLE001
+            pngu_proxy.DIAG.bump("parse_fail")
+            pngu_proxy.DIAG.add("parse_fail",
+                                {"error": "%s: %s" % (type(e).__name__, e)})
             log.warning("parse 失败：%s: %s", type(e).__name__, e)
             return self._fail("%s: %s" % (type(e).__name__, e), retryable=True)
+
 
     # ------------------------------------------------------------ 内部
 
@@ -357,14 +441,16 @@ class Plugin(BasePlugin):
                     "source_mode=manual 但没有填「手动 m3u8 地址」")
             return (url, str(meta.get("page_url") or ""), {"from": "manual"})
 
-        # auto
+        # auto：先看平台有没有直接把最终 m3u8 交过来（STRM 二次解析就是这样），
+        # 有就直接用，省掉一次签名；没有才走 4k 签名取流。
+        url = str(target.get("url") or target.get("play_url") or "")
+        has_keys = bool(meta.get("data_id") and meta.get("play_key"))
+        if not has_keys and url.lower().split("?")[0].endswith((".m3u8", ".m3u")):
+            return (url, str(meta.get("page_url") or ""), {"from": "target"})
         if not meta:
-            url = str(target.get("url") or "")
-            if url.lower().endswith(".m3u8"):
-                return (url, "", {"from": "target"})
             raise pngu_fetch.FetchError(
-                "没拿到 4k 播放参数（meta 为空）。如果这是手动调试，"
-                "请把 source_mode 改成 manual 并填 m3u8 地址。")
+                "没拿到 4k 播放参数（meta 为空，target 里也没有 m3u8 地址）。"
+                "如果这是手动调试，请把 source_mode 改成 manual 并填 m3u8 地址。")
 
         link, detail = pngu_fetch.resolve_4k(
             meta,
@@ -411,6 +497,9 @@ class Plugin(BasePlugin):
 
     def _ok(self, url, access_mode, meta):
         stream = self._stream(url, access_mode, meta)
+        pngu_proxy.DIAG.bump("parse_ok")
+        pngu_proxy.DIAG.add("parse_ok", {"url": url,
+                                         "access_mode": access_mode})
         return self._dump({
             "success": True,
             "provider_plugin_id": self.plugin_id,
