@@ -1,0 +1,167 @@
+{
+  "id": "parser.pngunwrap",
+  "name": "PNG 壳分片剥离",
+  "version": "0.1.0",
+  "category": "parser",
+  "description": "把伪装成 PNG 的 HLS 分片剥回可播放的 TS。插件内建一个进程内 HLS 反代，平台代理或播放器访问它时现场剥壳，不需要改动任何现有插件。优先级 26，只接管 4k 来源，其余一律放行。",
+  "core_version": ">=1.0.0 <2.0.0",
+  "contract_version": "1.0",
+  "capabilities": [
+    "parser.resolve"
+  ],
+  "backend": {
+    "entry": "backend.plugin:plugin"
+  },
+  "permissions": [
+    "network"
+  ],
+  "dependencies": [],
+  "config_schema": [
+    {
+      "key": "enabled",
+      "label": "启用本插件",
+      "type": "boolean",
+      "required": false,
+      "default": true,
+      "description": "关掉后立刻完全让路给原来的 4k 解析插件，不需要卸载。",
+      "secret": false,
+      "group": "总开关"
+    },
+    {
+      "key": "source_mode",
+      "label": "取流模式",
+      "type": "select",
+      "required": false,
+      "default": "auto",
+      "description": "auto = 用 4k 播放参数自动签名取流；manual = 直接用下面填的 m3u8；demo = 内置测试清单，只验证链路。",
+      "secret": false,
+      "group": "取流",
+      "options": [
+        { "value": "auto", "label": "自动（4k 签名取流）" },
+        { "value": "manual", "label": "手动 m3u8" },
+        { "value": "demo", "label": "内置测试（验证链路）" }
+      ]
+    },
+    {
+      "key": "external_m3u8",
+      "label": "手动 m3u8 地址",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "description": "source_mode=manual 时使用，可直接填一条 PNG 壳分片的 m3u8 用于调试。",
+      "secret": false,
+      "group": "取流"
+    },
+    {
+      "key": "base_url",
+      "label": "4k 站点地址",
+      "type": "text",
+      "required": false,
+      "default": "https://www.4kvms.org",
+      "description": "留空用默认；站点换域名时改这里。",
+      "secret": false,
+      "group": "取流"
+    },
+    {
+      "key": "play_quality",
+      "label": "优先画质",
+      "type": "select",
+      "required": false,
+      "default": "1080",
+      "description": "取不到时按 1080 → 720 依次回退。",
+      "secret": false,
+      "group": "取流",
+      "options": [
+        { "value": "2160", "label": "2160p" },
+        { "value": "1080", "label": "1080p" },
+        { "value": "720", "label": "720p" }
+      ]
+    },
+    {
+      "key": "cookie",
+      "label": "4k Cookie",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "description": "可选；登录态能拿到更高画质。",
+      "secret": true,
+      "group": "取流"
+    },
+    {
+      "key": "access_mode",
+      "label": "交给平台的方式",
+      "type": "select",
+      "required": false,
+      "default": "proxy",
+      "description": "proxy = 平台代拉（零部署改动，推荐）；direct = 播放器直连插件端口，需要在 compose 里把端口映射出来。",
+      "secret": false,
+      "group": "服务",
+      "options": [
+        { "value": "proxy", "label": "proxy：平台代理转发" },
+        { "value": "direct", "label": "direct：播放器直连" }
+      ]
+    },
+    {
+      "key": "bind_host",
+      "label": "监听地址",
+      "type": "select",
+      "required": false,
+      "default": "127.0.0.1",
+      "description": "proxy 模式用 127.0.0.1；direct 模式要改 0.0.0.0 并映射端口。",
+      "secret": false,
+      "group": "服务",
+      "options": [
+        { "value": "127.0.0.1", "label": "127.0.0.1" },
+        { "value": "0.0.0.0", "label": "0.0.0.0" }
+      ]
+    },
+    {
+      "key": "listen_port",
+      "label": "监听端口",
+      "type": "text",
+      "required": false,
+      "default": "18521",
+      "description": "被占用时自动往后顺延最多 10 个。",
+      "secret": false,
+      "group": "服务"
+    },
+    {
+      "key": "public_base",
+      "label": "对外地址",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "description": "仅 direct 模式需要，例如 http://192.168.1.10:18521。留空则用请求头。",
+      "secret": false,
+      "group": "服务"
+    },
+    {
+      "key": "cache_mb",
+      "label": "分片缓存上限（MB）",
+      "type": "text",
+      "required": false,
+      "default": "64",
+      "description": "按字节封顶，不会因为片数多而吃爆内存。",
+      "secret": false,
+      "group": "缓存"
+    },
+    {
+      "key": "cache_ttl",
+      "label": "分片保留秒数",
+      "type": "text",
+      "required": false,
+      "default": "30",
+      "description": "播放过的分片超过这个时间就回收。",
+      "secret": false,
+      "group": "缓存"
+    }
+  ],
+  "resource": {
+    "priority": 26
+  },
+  "ui": {
+    "menus": [],
+    "settings_sections": [],
+    "task_templates": []
+  }
+}
