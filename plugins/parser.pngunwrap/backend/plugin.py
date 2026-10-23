@@ -48,6 +48,11 @@ except Exception as _e:                             # noqa: BLE001
         return dict(kw)
 
     def HealthReport(**kw):
+        # 桩也要按 Literal 校验，否则本地测试拦不住 "warning" 这类错误 ——
+        # 0.2.0 装不上就是这么漏过去的。
+        st = kw.get("status")
+        if st not in ("ok", "degraded", "error", "unknown"):
+            raise ValueError("HealthReport status 非法：%r" % (st,))
         return dict(kw)
 
     class _Model(object):
@@ -95,6 +100,20 @@ def _snap(obj, limit=1500):
     return s[:limit]
 
 
+# HealthReport.status 是 Literal 校验。写错一个词（比如 "warning"）会让平台在
+# 安装阶段直接 pydantic validation error，插件装不上 —— 所以这里白名单 + 兜底。
+_HEALTH_STATUS = ("ok", "degraded", "error", "unknown")
+
+
+def _health(status, message, details=None):
+    st = status if status in _HEALTH_STATUS else "unknown"
+    try:
+        return HealthReport(status=st, message=message, details=details or {})
+    except Exception as e:                          # noqa: BLE001
+        log.warning("HealthReport 构造失败，降级成 dict：%s", e)
+        return {"status": st, "message": message, "details": details or {}}
+
+
 def _as_bool(v, default=True):
     """`int(x or default)` 会把 0 吞成默认值 —— 这里显式处理。"""
     if v is None or v == "":
@@ -121,7 +140,7 @@ def _as_int(v, default, lo=None, hi=None):
 class Plugin(BasePlugin):
     plugin_id = "parser.pngunwrap"
     plugin_name = "PNG 壳分片剥离"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
 
     def __init__(self):
         self._cfg = dict(DEFAULTS)
@@ -134,15 +153,40 @@ class Plugin(BasePlugin):
 
     def set_runtime_config(self, config):
         cfg = dict(DEFAULTS)
-        if isinstance(config, dict):
-            for k, v in config.items():
+        data = self._as_mapping(config)
+        if isinstance(data, dict):
+            for k, v in data.items():
                 # 只接受已知键；允许空字符串（用户主动清空某一项）
                 if k in DEFAULTS and v is not None:
                     cfg[k] = v
         self._cfg = cfg
         log.info("配置已更新：source_mode=%s access_mode=%s bind=%s:%s "
-                 "enabled=%s", cfg["source_mode"], cfg["access_mode"],
-                 cfg["bind_host"], cfg["listen_port"], cfg["enabled"])
+                 "enabled=%s supports_mode=%s", cfg["source_mode"],
+                 cfg["access_mode"], cfg["bind_host"], cfg["listen_port"],
+                 cfg["enabled"], cfg["supports_mode"])
+
+    @staticmethod
+    def _as_mapping(obj):
+        """平台可能传 dict，也可能传 pydantic 模型 / dataclass。
+
+        以前只认 dict，一旦平台换成模型对象，配置会被**整份静默忽略**
+        （全部回落到默认值），排查起来极难。这里统一成 dict。
+        """
+        if obj is None or isinstance(obj, dict):
+            return obj
+        for attr in ("model_dump", "dict", "_asdict"):
+            fn = getattr(obj, attr, None)
+            if callable(fn):
+                try:
+                    got = fn()
+                    if isinstance(got, dict):
+                        return got
+                except Exception:                   # noqa: BLE001
+                    pass
+        try:
+            return dict(obj)
+        except Exception:                           # noqa: BLE001
+            return None
 
     def get_runtime_config_schema(self):
         return [
@@ -265,32 +309,36 @@ class Plugin(BasePlugin):
                 log.warning("停止内建服务失败：%s", e)
 
     def health(self, ctx=None):
-        problems = []
-        if not _SDK:
-            problems.append("core.sdk 导入失败：%s" % _SDK_ERR)
-        if not self._enabled():
-            problems.append("插件在配置里被关闭（enabled=false）")
+        # 整体兜底：health 抛异常会让平台判插件不可用甚至装不上，
+        # 所以这里任何意外都转成 degraded 文本返回。
+        try:
+            problems = []
+            if not _SDK:
+                problems.append("core.sdk 导入失败：%s" % _SDK_ERR)
+            if not self._enabled():
+                problems.append("插件在配置里被关闭（enabled=false）")
 
-        wasm = os.path.join(HERE, "vendor", pngu_sign_filename())
-        if not os.path.isfile(wasm):
-            problems.append("缺少 wasm 模块：vendor/%s" % pngu_sign_filename())
+            wasm = os.path.join(HERE, "vendor", pngu_sign_filename())
+            if not os.path.isfile(wasm):
+                problems.append("缺少 wasm 模块：vendor/%s" % pngu_sign_filename())
 
-        proxy = self._proxy
-        details = {
-            "enabled": self._enabled(),
-            "supports_mode": self._cfg.get("supports_mode"),
-            "source_mode": self._cfg.get("source_mode"),
-            "access_mode": self._cfg.get("access_mode"),
-            "service": proxy_health_of(proxy),
-            "wasm": os.path.isfile(wasm),
-            "sdk": _SDK,
-            "diag": pngu_proxy.DIAG.snapshot(),
-        }
-        if problems:
-            return HealthReport(status="warning",
-                                message="；".join(problems), details=details)
-        return HealthReport(status="ok",
-                            message="PNG 壳剥离已就绪。", details=details)
+            proxy = self._proxy
+            details = {
+                "enabled": self._enabled(),
+                "supports_mode": self._cfg.get("supports_mode"),
+                "source_mode": self._cfg.get("source_mode"),
+                "access_mode": self._cfg.get("access_mode"),
+                "service": proxy_health_of(proxy),
+                "wasm": os.path.isfile(wasm),
+                "sdk": _SDK,
+                "diag": pngu_proxy.DIAG.snapshot(),
+            }
+            if problems:
+                return _health("degraded", "；".join(problems), details)
+            return _health("ok", "PNG 壳剥离已就绪。", details)
+        except Exception as e:                      # noqa: BLE001
+            log.warning("health 异常：%s: %s", type(e).__name__, e)
+            return _health("degraded", "自检异常：%s: %s" % (type(e).__name__, e))
 
     def health_score(self):
         """T3FAP 解析链用它对插件排序/过滤（rules.md §4.6 要求实现）。
