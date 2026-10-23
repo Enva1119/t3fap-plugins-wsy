@@ -46,12 +46,15 @@ class FetchError(RuntimeError):
 
 # ---------------------------------------------------------------- 网络
 
-def http_get_ex(url, referer="", timeout=FETCH_TIMEOUT, cookie=""):
+def http_get_ex(url, referer="", timeout=FETCH_TIMEOUT, cookie="", extra=None):
     """同 http_get，但多返回**最终 URL**（跟随 302 之后的那个）。
 
     T3FAP 的 `/api/strm/o/<token>` 是稳定的门票地址，每次 302 到当次的上游
     m3u8（上游地址带时效）。清单里的分片必须相对**最终地址**解析，否则
     urljoin 会拿门票地址当 base，拼出来的分片地址全是错的。
+
+    extra：额外请求头（dict）。目前用于探测时发 `Range: bytes=0-262143`，
+    只取分片开头一段就能判断有没有 PNG 壳，不必整片拉下来。
     """
     req = urllib.request.Request(url)
     req.add_header("User-Agent", UA)
@@ -60,6 +63,8 @@ def http_get_ex(url, referer="", timeout=FETCH_TIMEOUT, cookie=""):
         req.add_header("Referer", referer)
     if cookie:
         req.add_header("Cookie", cookie)
+    for k, v in (extra or {}).items():
+        req.add_header(k, v)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read()
         ctype = resp.headers.get("Content-Type", "")

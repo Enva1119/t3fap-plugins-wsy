@@ -554,6 +554,25 @@ def handle_path(proxy, path, query="", prefix=""):
     if head == "__diag":
         return _json({"health": proxy_health(proxy), "diag": DIAG.snapshot()})
 
+    # 接管状态：看的不是「插件有没有在跑」，而是「内核那条 302 路由有没有被包住」
+    if head == "__hijack":
+        import pngu_hijack
+        return _json(pngu_hijack.state())
+
+    # 给一个上游 m3u8 地址，直接告诉你「会不会被接管、为什么」
+    if head == "__probe":
+        src = (q.get("url") or [""])[0].strip()
+        if not src:
+            return _json({"ok": False,
+                          "error": "用法：/__probe?url=<上游 m3u8 地址>"}, 400)
+        import pngu_hijack
+        val = pngu_hijack._probe(src)
+        val["ok"] = True
+        val["src"] = src
+        val["verdict"] = "会接管（分片被剥壳）" if val.get("wrapped") \
+            else "不接管（原样放行 302）"
+        return _json(val)
+
     def _register(src, ref=""):
         """登记一条源并返回会话；失败抛异常由上层转成 502。"""
         tok = _b64e(src)

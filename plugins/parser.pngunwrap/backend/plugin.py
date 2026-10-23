@@ -69,6 +69,7 @@ except Exception as _e:                             # noqa: BLE001
     ParseResult = ParseStream = _Model
 
 import pngu_fetch
+import pngu_hijack
 import pngu_mount
 import pngu_proxy
 
@@ -85,12 +86,18 @@ DEFAULTS = {
     "cookie": "",
     "access_mode": "proxy",         # proxy / direct
     "mount_on_platform": True,      # 挂到平台 8521（推荐），失败自动回退独立端口
+    "hijack_strm": True,            # 接管内核 /api/strm/*.m3u8，已有 .strm 不用改
     "bind_host": "127.0.0.1",
     "listen_port": "18521",
     "public_base": "",
     "cache_mb": "64",
     "cache_ttl": "30",
 }
+
+
+# 挂载/接管失败后的最小重试间隔（秒）。插件加载时机未必晚于平台建 app，
+# 所以不能「试一次失败就永久放弃」；但也别每个请求都去扫一遍 sys.modules。
+_MOUNT_RETRY_SEC = 15.0
 
 
 def _snap(obj, limit=1500):
@@ -142,7 +149,7 @@ def _as_int(v, default, lo=None, hi=None):
 class Plugin(BasePlugin):
     plugin_id = "parser.pngunwrap"
     plugin_name = "PNG 壳分片剥离"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
 
     def __init__(self):
         self._cfg = dict(DEFAULTS)
@@ -151,6 +158,7 @@ class Plugin(BasePlugin):
         self._seen_sig = set()
         self._last_log = 0.0
         self._mount_tried = False
+        self._mount_at = 0.0
 
     # ------------------------------------------------------------ 配置
 
@@ -167,6 +175,14 @@ class Plugin(BasePlugin):
                  "enabled=%s supports_mode=%s", cfg["source_mode"],
                  cfg["access_mode"], cfg["bind_host"], cfg["listen_port"],
                  cfg["enabled"], cfg["supports_mode"])
+
+        # 用户刚改了配置，立刻按新配置重挂一次（挂载/接管都是幂等的）。
+        # 典型场景：先装插件、后发现接管没生效，去把 hijack_strm 打开 —— 这时
+        # 不该要求重启平台才生效。
+        if self._proxy is not None and self._proxy.running:
+            self._mount_tried = False
+            self._mount_at = 0.0
+            self._try_mount(self._proxy, force=True)
 
     @staticmethod
     def _as_mapping(obj):
@@ -239,6 +255,14 @@ class Plugin(BasePlugin):
                         default="", secret=True,
                         description="可选；登录态能拿到更高画质。",
                         group="取流"),
+            ConfigField(key="hijack_strm", label="接管平台 STRM 播放链路",
+                        type="boolean", default=True,
+                        description="开启后插件会包住平台内核的 /api/strm/*.m3u8 "
+                                    "路由：播放器请求原来的 STRM 地址时，插件先探一下"
+                                    "上游分片是不是 PNG 壳，是就改写成剥壳后的清单，"
+                                    "不是就原样返回原来的 302。**媒体库里已有的 .strm "
+                                    "文件不需要任何改动、也不需要重扫**。",
+                        group="服务"),
             ConfigField(key="mount_on_platform", label="挂到平台统一端口",
                         type="boolean", default=True,
                         description="开启后把剥壳服务挂到 T3FAP 自己的 FastAPI 上，"
@@ -298,7 +322,25 @@ class Plugin(BasePlugin):
         return True
 
     def register(self, ctx=None):
+        """平台加载插件时就会调这里 —— **趁这个时机把挂载和接管装好**。
+
+        这一点很关键：接管发生在 `register` 还是「第一次 parse」差别巨大。
+        播 STRM 时平台根本不走解析链（内核 302 直达上游），`parse()` 永远不会
+        被调用；如果等到 parse 才装接管，就等于没装。所以这里主动拉起来。
+        """
+        self._bootstrap()
         return True
+
+    def _bootstrap(self):
+        """尽力把内建服务 + 平台挂载 + STRM 接管装好；失败只记日志。"""
+        try:
+            if self._disabled or not self._enabled():
+                return
+            proxy = self._ensure_proxy()
+            self._try_mount(proxy)
+        except Exception as e:                      # noqa: BLE001
+            log.warning("启动时初始化未完成（不影响其它插件）：%s: %s",
+                        type(e).__name__, e)
 
     def enable(self, ctx=None):
         self._disabled = False
@@ -321,10 +363,15 @@ class Plugin(BasePlugin):
 
     def _shutdown(self):
         try:
+            pngu_hijack.unhijack()
+        except Exception as e:                      # noqa: BLE001
+            log.warning("还原 STRM 路由失败（不影响运行）：%s", e)
+        try:
             pngu_mount.unmount()
         except Exception as e:                      # noqa: BLE001
             log.warning("摘除平台路由失败（不影响运行）：%s", e)
         self._mount_tried = False
+        self._mount_at = 0.0
         proxy, self._proxy = self._proxy, None
         if proxy:
             try:
@@ -354,6 +401,7 @@ class Plugin(BasePlugin):
                 "access_mode": self._cfg.get("access_mode"),
                 "service": proxy_health_of(proxy),
                 "mount": pngu_mount.state(),
+                "hijack": pngu_hijack.state(),
                 "wasm": os.path.isfile(wasm),
                 "sdk": _SDK,
                 "diag": pngu_proxy.DIAG.snapshot(),
@@ -555,24 +603,49 @@ class Plugin(BasePlugin):
         self._try_mount(proxy)
         return proxy
 
-    def _try_mount(self, proxy):
-        """尝试把服务挂到平台 8521 上（只试一次，失败不重试也不报错）。
+    def _try_mount(self, proxy, force=False):
+        """把服务挂上平台，并接管内核的 STRM 播放入口。
 
-        平台是 FastAPI，插件在同进程里，`app.mount()` 之后播放器直接访问
-        `http://<NAS>:8521/api/strm/pngu/...` 即可，不用额外映射端口。
+        顺序很重要：先 `app.mount()` 让 `/api/strm/pngu/...` 存在，再包住内核
+        那条 302 路由。反过来的话，改写出来的清单会指向一个还不存在的路径。
+
+        **失败可重试**。插件 `register()` 的时机未必晚于平台构造 FastAPI 应用；
+        如果那一刻 `sys.modules` 里还没有 app，就什么都找不到。以前把
+        `_mount_tried` 一上来就置 True，等于「试一次失败就永久放弃」——
+        现在只有**真正装好**才置 True，其余情况留待下一次（首次播放请求或
+        配置变更）再试，间隔不低于 `_MOUNT_RETRY_SEC` 秒。
         """
-        if self._mount_tried:
+        if not force and self._mount_tried:
             return
-        self._mount_tried = True
+        if not force and (time.time() - self._mount_at) < _MOUNT_RETRY_SEC:
+            return
+        self._mount_at = time.time()
+
         if not _as_bool(self._cfg.get("mount_on_platform"), True):
             log.info("mount_on_platform 已关闭，只用独立端口 %d", proxy.port)
+            self._mount_tried = True
             return
+
         ok, msg = pngu_mount.mount(proxy)
-        if ok:
-            log.info("挂到平台 8521 成功：%s", msg)
-        else:
-            log.info("挂到平台 8521 未成功（回退独立端口 %d）：%s",
+        if not ok:
+            log.info("挂到平台 8521 未成功（回退独立端口 %d，稍后再试）：%s",
                      proxy.port, msg)
+            # 没挂上就没有 /api/strm/pngu/seg/... 可指，别去接管内核路由
+            return
+        log.info("挂到平台 8521 成功：%s", msg)
+
+        if not _as_bool(self._cfg.get("hijack_strm"), True):
+            log.info("hijack_strm 已关闭，不接管内核 STRM 路由")
+            self._mount_tried = True
+            return
+
+        ok2, msg2 = pngu_hijack.hijack(proxy)
+        if ok2:
+            self._mount_tried = True
+            log.info("接管 STRM 播放链路成功：%s", msg2)
+        else:
+            log.info("接管 STRM 播放链路未成功（稍后再试；手动地址 "
+                     "/api/strm/pngu/ 不受影响）：%s", msg2)
 
     def _platform_prefix(self, proxy):
         """挂载成功时返回 8521 上的前缀地址；否则返回空串。

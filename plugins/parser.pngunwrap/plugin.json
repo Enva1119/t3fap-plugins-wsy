@@ -1,7 +1,7 @@
 {
   "id": "parser.pngunwrap",
   "name": "PNG 壳分片剥离",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "category": "parser",
   "description": "把伪装成 PNG 的 HLS 分片剥回可播放的 TS。插件内建一个进程内 HLS 反代，平台代理或播放器访问它时现场剥壳，不需要改动任何现有插件。优先级 8（T3FAP 里数值越小越优先，排在 4k 的 25 之前），只接管 4k 来源，其余一律放行。",
   "core_version": ">=1.0.0 <2.0.0",
@@ -100,6 +100,16 @@
       "description": "可选；登录态能拿到更高画质。",
       "secret": true,
       "group": "取流"
+    },
+    {
+      "key": "hijack_strm",
+      "label": "接管平台 STRM 播放链路",
+      "type": "boolean",
+      "required": false,
+      "default": true,
+      "description": "开启后插件会包住平台内核的 /api/strm/*.m3u8 路由：播放器请求原来的 STRM 地址时，插件先探一下上游分片是不是 PNG 壳 —— 是就 200 返回剥壳后的清单，不是就原样返回原来的 302（与装插件前完全一致）。所以媒体库里已有的 .strm 文件**不需要改动、也不需要重扫**。依赖「挂到平台统一端口」成功，否则自动跳过。",
+      "secret": false,
+      "group": "服务"
     },
     {
       "key": "mount_on_platform",
