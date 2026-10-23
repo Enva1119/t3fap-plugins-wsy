@@ -78,6 +78,7 @@ _STATE = {
     "pass": 0,              # 判定为非 PNG、原样放行的次数
     "fail": 0,              # 探测失败而放行的次数
     "last": "",             # 最近一次判定的说明
+    "mode": "",             # route = 换路由 app；middleware = 最外层中间件
 }
 
 _LOCK = threading.Lock()
@@ -648,6 +649,20 @@ def serve(path):
     """
     parts = [p for p in (path or "").split("/") if p]
     if len(parts) < 2:
+        # 诊断口即使 pngu_proxy 是旧版也要能用 —— 这里不依赖它。
+        if parts and parts[0] in ("__hijack", "__dump"):
+            import json
+            if parts[0] == "__hijack":
+                payload = state()
+            else:
+                payload = {"hijack": state()}
+                try:
+                    import pngu_mount
+                    payload["mount"] = pngu_mount.diagnose()
+                except Exception as e:              # noqa: BLE001
+                    payload["mount_error"] = "%s: %s" % (type(e).__name__, e)
+            return (200, "application/json; charset=utf-8",
+                    json.dumps(payload, ensure_ascii=False, indent=2).encode())
         return None
 
     head = parts[0]
@@ -724,43 +739,201 @@ def _already_wrapped(route):
     return getattr(getattr(route, "app", None), "_pngu_origin", None) is not None
 
 
+def _eligible_route(route):
+    """这条路由能不能靠换 `.app` 接管。
+
+    FastAPI 的 APIRoute 一定有 `endpoint`，真正被调用的是 `self.app`；
+    Mount 之类没有 `endpoint`，只能整块包住。
+    """
+    return hasattr(route, "endpoint") and getattr(route, "app", None) is not None
+
+
+# ---------------------------------------------------------------- 中间件兜底
+# 万一路由对象拿不到（302 由中间件产出、路由表被自定义 Router 包了一层、
+# 或者平台版本把路由藏进了闭包），还有最后一条路：在应用最外层包一个 ASGI
+# 中间件。它同时干两件事 —— 拦 3xx 的 strm 清单请求、自己服务
+# `/api/strm/pngu/*`（这样连 mount 都不依赖了）。
+
+MW_FLAG = "_pngu_middleware"
+
+
+async def _mw_respond(send, code, ctype, blob, method="GET"):
+    headers = [(b"content-type", ctype.encode("latin-1")),
+               (b"content-length", str(len(blob)).encode("latin-1")),
+               (b"cache-control", b"no-store"),
+               (b"access-control-allow-origin", b"*")]
+    await send({"type": "http.response.start", "status": code,
+                "headers": headers})
+    await send({"type": "http.response.body",
+                "body": b"" if method == "HEAD" else blob})
+
+
+def _mw_class(proxy):
+    """造一个 Starlette 中间件类（Starlette 会以 `cls(app)` 实例化）。"""
+
+    class _PnguMiddleware(object):
+        _pngu_middleware = True
+
+        def __init__(self, app):
+            self.app = app
+            self.wrap = _wrap_route_app(proxy, app)
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") != "http":
+                return await self.app(scope, receive, send)
+            path = scope.get("path") or ""
+            method = (scope.get("method") or "GET").upper()
+
+            # 1) 自家路径由自己服务，绕开 mount
+            if path.startswith(SELF_PREFIX):
+                sub = path[len(SELF_PREFIX):] or "/"
+                try:
+                    hit = serve(sub)
+                except Exception as e:              # noqa: BLE001
+                    hit = (502, "application/json; charset=utf-8",
+                           ('{"ok": false, "error": "%s"}'
+                            % str(e)[:160].replace('"', "'")).encode())
+                if hit is not None:
+                    _bump("hit")
+                    return await _mw_respond(send, hit[0], hit[1], hit[2], method)
+                return await self.app(scope, receive, send)
+
+            # 2) 只拦 STRM 播放入口，其它请求原样透传（不缓冲不回绕）
+            if path.startswith(INCLUDE_PREFIX) and path.endswith(".m3u8"):
+                return await self.wrap(scope, receive, send)
+            return await self.app(scope, receive, send)
+
+    _PnguMiddleware.__name__ = "PnguStrmMiddleware"
+    return _PnguMiddleware
+
+
+_MW_INSTALLED = []          # [(app, 原 user_middleware 列表快照)]
+
+
+def install_middleware(proxy):
+    """把兜底中间件装到所有找到的应用上。返回 (ok, message)。"""
+    try:
+        import pngu_mount
+    except Exception as e:                          # noqa: BLE001
+        return False, "挂载模块不可用：%s" % e
+
+    try:
+        from starlette.middleware import Middleware as _MW
+    except Exception as e:                          # noqa: BLE001
+        return False, "平台没有 starlette（%s），走不了中间件兜底" % e
+
+    apps = pngu_mount.find_apps()
+    if not apps:
+        return False, "没找到可安装中间件的应用"
+
+    done, last = [], ""
+    cls = _mw_class(proxy)
+    for name, app in apps:
+        mws = getattr(app, "user_middleware", None)
+        if not isinstance(mws, list):
+            continue
+        if any(getattr(getattr(m, "cls", None), MW_FLAG, False) for m in mws):
+            done.append(name)
+            continue
+        try:
+            mws.insert(0, _MW(cls))
+            _MW_INSTALLED.append((app, mws))
+            if getattr(app, "middleware_stack", None) is not None:
+                app.middleware_stack = app.build_middleware_stack()
+            done.append(name)
+        except Exception as e:                      # noqa: BLE001
+            last = "%s: %s" % (type(e).__name__, e)
+
+    if not done:
+        return False, last or "没有可安装中间件的应用"
+
+    with _LOCK:
+        _STATE.update(hijacked=len(done), routes=["(middleware)"],
+                      app=done[0], mode="middleware", reason="")
+    log.info("已用中间件接管 STRM（%s）", ", ".join(done))
+    return True, "中间件接管 %d 个应用：%s" % (len(done), ", ".join(done))
+
+
+def remove_middleware():
+    n = 0
+    for app, mws in list(_MW_INSTALLED):
+        try:
+            for i in range(len(mws) - 1, -1, -1):
+                if getattr(getattr(mws[i], "cls", None), MW_FLAG, False):
+                    del mws[i]
+                    n += 1
+            if getattr(app, "middleware_stack", None) is not None:
+                app.middleware_stack = app.build_middleware_stack()
+        except Exception:                           # noqa: BLE001
+            pass
+    del _MW_INSTALLED[:]
+    return n
+
+
+def _candidate_routes():
+    """枚举要接管的 STRM 路由，返回 [(应用名, 完整路径, 路由对象)]。
+
+    0.4.1 是「遍历 app.router.routes，看 path 是否以 /api/strm/ 开头」——
+    真机报「没有匹配到 STRM 播放路由」，可挂载又是成功的，说明找到的 app
+    和真正在服务 HTTP 的不是同一层（子应用 / 容器里的 app）。现在按
+    **路由归属**反查：谁的路由表里有 `/api/strm/*.m3u8`，就接管谁。
+    """
+    import pngu_mount
+    out = []
+    for name, _owner, full, route in pngu_mount.strm_routes():
+        out.append((name, full, route))
+    return out
+
+
 def hijack(proxy):
-    """包住平台所有 STRM 播放入口。返回 (ok, message)，永不抛。"""
+    """包住平台所有 STRM 播放入口。返回 (ok, message)，永不抛。
+
+    两条路：能拿到路由对象就换 `route.app`（最轻、可精确还原）；
+    拿不到就退化成最外层 ASGI 中间件（见 `install_middleware`）。
+    """
     if _ORIG:
         return True, "已接管 %d 条路由" % len(_ORIG)
     try:
-        import pngu_mount
-        apps = pngu_mount.find_apps()
-        if not apps:
-            _STATE["reason"] = "没在 sys.modules 里找到 FastAPI 应用"
-            return False, _STATE["reason"]
+        cands = _candidate_routes()
+        if not cands:
+            ok, msg = install_middleware(proxy)
+            if not ok:
+                _STATE["reason"] = "没有匹配到 STRM 播放路由；中间件兜底也失败：%s" % msg
+            return ok, _STATE["reason"] or msg
 
-        wrapped, last = [], ""
-        for name, app in apps:
-            router = getattr(app, "router", None)
-            routes = getattr(router, "routes", None)
-            if not isinstance(routes, list):
+        wrapped, last, app_name = [], "", ""
+        for name, full, route in cands:
+            if _already_wrapped(route):
+                wrapped.append(full)
+                app_name = app_name or name
                 continue
-            for route in list(routes):
-                if not _eligible(route):
-                    continue
-                if _already_wrapped(route):
-                    continue
-                try:
+            try:
+                if _eligible_route(route):
                     orig = route.app
                     route.app = _wrap_route_app(proxy, orig)
-                    _ORIG.append((route, orig))
-                    wrapped.append(getattr(route, "path", ""))
-                except Exception as e:              # noqa: BLE001
-                    last = "%s: %s" % (type(e).__name__, e)
+                else:
+                    # Mount / 子应用：整块包住
+                    orig = getattr(route, "app", None)
+                    if orig is None:
+                        raise RuntimeError("路由没有 app 属性")
+                    route.app = _wrap_route_app(proxy, orig)
+                _ORIG.append((route, orig))
+                wrapped.append(full)
+                app_name = app_name or name
+            except Exception as e:                  # noqa: BLE001
+                last = "%s: %s" % (type(e).__name__, e)
 
         if not _ORIG:
-            _STATE["reason"] = last or "没有匹配到 STRM 播放路由"
+            ok, msg = install_middleware(proxy)
+            if ok:
+                return ok, msg
+            _STATE["reason"] = "路由存在但接管失败（%s）；中间件兜底也失败：%s" % (
+                last, msg)
             return False, _STATE["reason"]
 
         with _LOCK:
-            _STATE.update(hijacked=len(_ORIG), routes=wrapped,
-                          app=name, reason="")
+            _STATE.update(hijacked=len(_ORIG), routes=wrapped, mode="route",
+                          app=app_name, reason="")
         log.info("已接管 %d 条 STRM 路由：%s", len(wrapped), ", ".join(wrapped))
         return True, "已接管 %d 条：%s" % (len(wrapped), ", ".join(wrapped))
     except Exception as e:                          # noqa: BLE001
@@ -770,9 +943,7 @@ def hijack(proxy):
 
 
 def unhijack():
-    """把原 app 装回去。"""
-    if not _ORIG:
-        return
+    """把原 app 装回去，并把兜底中间件摘掉。"""
     n = 0
     for route, orig in _ORIG:
         try:
@@ -781,12 +952,16 @@ def unhijack():
         except Exception:                           # noqa: BLE001
             pass
     _ORIG.clear()
+    try:
+        m = remove_middleware()
+    except Exception:                               # noqa: BLE001
+        m = 0
     with _LOCK:
-        _STATE.update(hijacked=0, routes=[], reason="")
-    if n:
-        log.info("已还原 %d 条 STRM 路由", n)
+        _STATE.update(hijacked=0, routes=[], reason="", mode="")
+    if n or m:
+        log.info("已还原 %d 条 STRM 路由 / 摘掉 %d 个兜底中间件", n, m)
 
 
 # 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
 # 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
-__version__ = "0.4.1"
+__version__ = "0.4.2"

@@ -44,29 +44,163 @@ def state():
     return dict(_STATE)
 
 
-def find_apps():
-    """在已加载的模块里找 FastAPI / Starlette 主应用。
+def _is_app(obj):
+    """鸭子类型判断一个对象是不是 Starlette/FastAPI 应用。
 
-    不写死 `from core.main import app` 之类的路径 —— 平台内部模块名随版本变，
-    遍历 `sys.modules` 找带 `mount` 方法且类名是 FastAPI/Starlette 的对象更稳。
-    找不到就返回空列表，调用方静默降级。
+    不看类名看结构：`mount()` + `router.routes` 是列表。这样平台的子应用、
+    被包过一层的中间件宿主都能识别出来。
+    """
+    if obj is None:
+        return False
+    try:
+        if not hasattr(obj, "mount"):
+            return False
+        router = getattr(obj, "router", None)
+        return isinstance(getattr(router, "routes", None), list)
+    except Exception:                               # noqa: BLE001
+        return False
+
+
+def _scan_modules():
+    """扫 `sys.modules` 里所有模块的属性，收集应用对象。
+
+    比只认 `mod.app` 宽得多：平台可能把 app 放在 `mod.application`、
+    `mod.server.app`、`mod.runtime.app` 甚至某个容器对象里。这里把模块级
+    属性逐个看一遍，再往 dict / list / 单层对象属性里探一层。
     """
     import sys
 
-    found = []
-    for name, mod in list(sys.modules.items()):
-        if mod is None or name.startswith("pngu"):
+    found, seen = [], set()
+
+    def push(name, obj):
+        if not _is_app(obj) or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        found.append((name, obj))
+
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or mod_name.startswith("pngu"):
             continue
         try:
-            obj = getattr(mod, "app", None)
+            items = list(vars(mod).items())
         except Exception:                           # noqa: BLE001
             continue
-        if obj is None:
-            continue
-        cls = type(obj).__name__
-        if cls in ("FastAPI", "Starlette") and hasattr(obj, "mount"):
-            found.append((name, obj))
+        for attr, val in items:
+            push("%s.%s" % (mod_name, attr), val)
+            if isinstance(val, dict):
+                for k, v in list(val.items())[:40]:
+                    push("%s.%s[%s]" % (mod_name, attr, k), v)
+            elif isinstance(val, (list, tuple)):
+                for i, v in enumerate(list(val)[:40]):
+                    push("%s.%s[%d]" % (mod_name, attr, i), v)
+
+    # gc 兜底：**每次都扫**，不是只在「一条都没找到」时扫。
+    # 平台很可能 `app = create_app()` 只活在函数里、由 uvicorn 用工厂串起来，
+    # 模块属性里一个 app 都没有；此时只找到插件宿主那类次级 app，
+    # 于是「挂载成功、接管却匹配不到路由」。类名是 FastAPI/Starlette 的对象
+    # 就那么几个，一次扫描几十毫秒，只在启动/改配置时跑。
+    try:
+        import gc
+        for obj in gc.get_objects():
+            try:
+                if type(obj).__name__ in ("FastAPI", "Starlette"):
+                    push("gc:%s" % id(obj), obj)
+            except Exception:                       # noqa: BLE001
+                continue
+    except Exception as e:                          # noqa: BLE001
+        log.info("gc 兜底扫描失败（忽略）：%s", e)
+
     return found
+
+
+def _iter_routes(app, prefix="", depth=0, root=None):
+    """递归产出 (完整路径, 路由对象, **根应用**)。
+
+    平台可能把 STRM 路由直接挂在主 app 上，也可能 `app.mount("/api", 子应用)`，
+    甚至套两层。Mount 的 `path` 只是前缀，真正的路由在它挂的子应用里 ——
+    所以要按 Mount 递归下去，并把前缀拼成完整路径。
+
+    第三个元素固定返回**根应用**，因为挂载必须挂在对外服务的那个 app 上：
+    挂到子应用上会变成 `/api/api/strm/pngu`，播放器访问不到。
+    """
+    root = root if root is not None else app
+    router = getattr(app, "router", None) or app
+    routes = getattr(router, "routes", None)
+    if not isinstance(routes, list):
+        return
+    for route in list(routes):
+        path = getattr(route, "path", "")
+        full = (prefix + path) if isinstance(path, str) else ""
+        if full:
+            yield full, route, root
+        if depth >= 3:
+            continue
+        sub = getattr(route, "app", None)
+        if sub is None or not hasattr(sub, "routes"):
+            continue
+        for item in _iter_routes(sub, full, depth + 1, root):
+            yield item
+
+
+def _looks_strm(full):
+    from pngu_hijack import INCLUDE_PREFIX, SELF_PREFIX
+    if not isinstance(full, str):
+        return False
+    if not full.startswith(INCLUDE_PREFIX):
+        return False
+    if full.startswith(SELF_PREFIX):
+        return False
+    return full.endswith(".m3u8")
+
+
+def strm_routes():
+    """找出所有 STRM 播放入口路由，返回 [(应用名, 应用, 完整路径, 路由)]。
+
+    0.4.1 只认「主 app 的 `router.routes` 里 path 以 `/api/strm/` 开头」，
+    真机上因此报「没有匹配到 STRM 播放路由」——挂载却成功了，说明找到的
+    app 跟真正在播的那个不是同一层。现在改成按**路由归属**找应用。
+    """
+    out, seen = [], set()
+    for name, app in _scan_modules():
+        for full, route, owner in _iter_routes(app):
+            if not _looks_strm(full):
+                continue
+            key = (id(owner), full)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((name, owner, full, route))
+    return out
+
+
+def find_apps():
+    """可能承载平台 HTTP 服务的应用，**持有 STRM 路由的排在最前面**。
+
+    排第一位的会被 `mount()` 用作挂载目标 —— 这一点很关键：如果挂到了
+    一个不对外服务的 app 上，`/api/strm/pngu/...` 虽然「挂载成功」，
+    播放器却访问不到。
+    """
+    apps = _scan_modules()
+    owners = {id(owner) for _n, owner, _p, _r in strm_routes()}
+    first = [(n, a) for n, a in apps if id(a) in owners]
+    rest = [(n, a) for n, a in apps if id(a) not in owners]
+    return first + rest
+
+
+def diagnose():
+    """排障用：找到几个应用、各自有没有 STRM 路由。"""
+    apps = []
+    for name, app in _scan_modules():
+        paths = [p for p, _r, _o in _iter_routes(app)]
+        apps.append({
+            "module": name,
+            "class": type(app).__name__,
+            "routes": len(paths),
+            "strm": [p for p in paths if "strm" in p][:12],
+            "m3u8": len([p for p in paths if p.endswith(".m3u8")]),
+        })
+    apps.sort(key=lambda a: -len(a["strm"]))
+    return {"apps": apps[:10], "mount": state()}
 
 
 def _build_asgi(proxy, prefix):
@@ -144,8 +278,40 @@ def _build_asgi(proxy, prefix):
     return app
 
 
+def _move_front(app, prefix):
+    """把刚挂上去的那条 Mount 挪到路由表最前面。
+
+    Starlette 按注册顺序匹配。平台常见写法是 `app.mount("/api", 子应用)`，
+    它一旦排在我们前面，`/api/strm/pngu/...` 就会先进子应用、拿到 404。
+    我们只占 `/api/strm/pngu` 这一个前缀，放最前面不影响任何已有路径。
+    """
+    try:
+        routes = getattr(getattr(app, "router", None), "routes", None)
+        if not isinstance(routes, list):
+            return False
+        idx = None
+        for i in range(len(routes) - 1, -1, -1):
+            r = routes[i]
+            if getattr(r, "path", "") != prefix:
+                continue
+            # 只挪我们自己的（新挂的是最后一个匹配项）
+            idx = i
+            break
+        if idx is None or idx == 0:
+            return idx == 0
+        routes.insert(0, routes.pop(idx))
+        return True
+    except Exception as e:                          # noqa: BLE001
+        log.info("调整挂载顺序失败（忽略）：%s", e)
+        return False
+
+
 def mount(proxy, prefix=PREFIX):
-    """尝试把服务挂到平台应用上。返回 (ok, message)，永不抛。"""
+    """尝试把服务挂到平台应用上。返回 (ok, message)，永不抛。
+
+    挂载目标优先选**持有 STRM 路由的那个应用** —— 挂到别的 app 上虽然也会
+    报成功，但播放器根本访问不到那个前缀。
+    """
     if _STATE["mounted"]:
         return True, "已挂载在 %s" % _STATE["prefix"]
     try:
@@ -162,10 +328,15 @@ def mount(proxy, prefix=PREFIX):
                 existing = [getattr(r, "path", "")
                             for r in getattr(app, "routes", [])]
                 if any(p == prefix for p in existing):
+                    _move_front(app, prefix)
                     _STATE.update(mounted=True, prefix=prefix,
                                   app=name, reason="")
                     return True, "已存在，复用 %s（%s）" % (prefix, name)
                 app.mount(prefix, asgi)
+                # **插到最前面**。平台可能 `app.mount("/api", 子应用)`，
+                # 那样 `/api/strm/pngu/...` 会先命中那个 Mount 被判 404 ——
+                # Starlette 按顺序匹配，只有排到它前面才轮得到我们。
+                _move_front(app, prefix)
                 _STATE.update(mounted=True, prefix=prefix, app=name, reason="")
                 log.info("已把剥壳服务挂到平台应用 %s 的 %s", name, prefix)
                 return True, "已挂载到 %s 的 %s" % (name, prefix)
@@ -212,4 +383,4 @@ def unmount():
 
 # 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
 # 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
-__version__ = "0.4.1"
+__version__ = "0.4.2"

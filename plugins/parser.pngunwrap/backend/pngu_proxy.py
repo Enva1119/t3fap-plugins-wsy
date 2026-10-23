@@ -774,4 +774,4 @@ def find_free_port(host, start):
 
 # 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
 # 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
-__version__ = "0.4.1"
+__version__ = "0.4.2"

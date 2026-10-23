@@ -798,8 +798,8 @@ class Plugin(BasePlugin):
             self._mount_tried = True
             log.info("接管 STRM 播放链路成功：%s", msg2)
         else:
-            log.info("接管 STRM 播放链路未成功（稍后再试；手动地址 "
-                     "/api/strm/pngu/ 不受影响）：%s", msg2)
+            log.info("接管 STRM 播放链路未成功（稍后再试；诊断见 "
+                     "/api/strm/pngu/__dump）：%s", msg2)
 
     def _platform_prefix(self, proxy):
         """挂载成功时返回 8521 上的前缀地址；否则返回空串。
