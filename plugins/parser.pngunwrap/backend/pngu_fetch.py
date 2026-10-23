@@ -46,7 +46,13 @@ class FetchError(RuntimeError):
 
 # ---------------------------------------------------------------- 网络
 
-def http_get(url, referer="", timeout=FETCH_TIMEOUT, cookie=""):
+def http_get_ex(url, referer="", timeout=FETCH_TIMEOUT, cookie=""):
+    """同 http_get，但多返回**最终 URL**（跟随 302 之后的那个）。
+
+    T3FAP 的 `/api/strm/o/<token>` 是稳定的门票地址，每次 302 到当次的上游
+    m3u8（上游地址带时效）。清单里的分片必须相对**最终地址**解析，否则
+    urljoin 会拿门票地址当 base，拼出来的分片地址全是错的。
+    """
     req = urllib.request.Request(url)
     req.add_header("User-Agent", UA)
     req.add_header("Accept", "*/*")
@@ -57,6 +63,12 @@ def http_get(url, referer="", timeout=FETCH_TIMEOUT, cookie=""):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read()
         ctype = resp.headers.get("Content-Type", "")
+        final = resp.geturl() or url
+    return data, ctype, final
+
+
+def http_get(url, referer="", timeout=FETCH_TIMEOUT, cookie=""):
+    data, ctype, _ = http_get_ex(url, referer, timeout, cookie)
     return data, ctype
 
 

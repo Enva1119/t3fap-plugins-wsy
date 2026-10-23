@@ -17,6 +17,7 @@ Content-Length: 0 就直接放弃，连 GET 都不发。
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -44,7 +46,7 @@ class Session(object):
 
     __slots__ = ("token", "src", "referer", "cookie", "segments", "keys",
                  "maps", "playlist", "created", "touched", "error",
-                 "raw_text", "render_prefix", "built")
+                 "raw_text", "render_prefix", "built", "final_src")
 
     def __init__(self, token, src, referer="", cookie=""):
         self.token = token
@@ -61,6 +63,7 @@ class Session(object):
         self.raw_text = None    # 源清单原文（None = demo 源）
         self.render_prefix = None   # 上次渲染用的 base，变了就重渲染
         self.built = False
+        self.final_src = ""     # 跟随 302 之后的真实清单地址
 
 
 class SegmentCache(object):
@@ -240,10 +243,15 @@ class HlsProxy(object):
 
     # ------------------------------------------------------------ 会话
 
-    def register(self, src_url, referer="", cookie="", prefix=""):
-        """登记一条源，返回可播放的清单地址。"""
-        self._seq += 1
-        token = "%x%04x" % (int(time.time()), self._seq & 0xFFFF)
+    def register(self, src_url, referer="", cookie="", prefix="", token=None):
+        """登记一条源，返回可播放的清单地址。
+
+        token 可指定：`/hls/u/<b64>` 这种自包含入口需要 token 本身带得动
+        源地址，这样重启后不需要任何登记记录也能重建会话。
+        """
+        if not token:
+            self._seq += 1
+            token = "%x%04x" % (int(time.time()), self._seq & 0xFFFF)
         sess = Session(token, src_url, referer, cookie)
         # 先构建一次，失败也要把会话留住（便于 /__health 看到错误）
         try:
@@ -278,13 +286,20 @@ class HlsProxy(object):
             sess.built = True
             return self._render(sess, prefix)
 
-        txt = pngu_fetch.http_text(sess.src, referer=sess.referer,
-                                   cookie=sess.cookie)
+        # 拿清单时一并取回「最终 URL」：sess.src 可能是 T3FAP 的门票地址
+        # （/api/strm/o/<token>，稳定但会 302），分片的相对路径必须按最终
+        # 地址解析，否则 urljoin 会以门票地址为 base，拼出一堆死链。
+        blob, _ctype, final_url = pngu_fetch.http_get_ex(
+            sess.src, referer=sess.referer, cookie=sess.cookie)
+        txt = blob.decode("utf-8", "replace")
         if "#EXTM3U" not in txt:
             raise RuntimeError("源地址返回的不是 m3u8（前 80 字节：%s）"
                                % txt[:80].replace("\n", " "))
 
-        base = sess.src
+        base = final_url or sess.src
+        if base != sess.src:
+            log.info("清单经 302 落到：%s", base[:100])
+            sess.final_src = base
         segs, keys, maps = [], [], []
         for raw in txt.splitlines():
             line = raw.strip()
@@ -376,6 +391,29 @@ class HlsProxy(object):
 
     # ------------------------------------------------------------ 取字节
 
+    def _fetch_segment(self, sess, idx):
+        """拉一片，带一层 Referer 策略。
+
+        有些站点的防盗链是「必须带 Referer」（4kvms 系），有些恰恰相反 ——
+        「带了就 403」（icve / douyinbit 系，curl 默认不发 Referer 反而能取）。
+        所以先按会话配置的 referer 取；没配或失败且是 401/403，再用清单地址
+        当 Referer 重试一次，两种站都能过。
+        """
+        url = sess.segments[idx]
+        try:
+            return pngu_fetch.http_get(url, referer=sess.referer,
+                                       cookie=sess.cookie)
+        except urllib.error.HTTPError as e:
+            if e.code not in (401, 403):
+                raise
+            alt = sess.referer or ""
+            if alt and alt != sess.src:
+                raise
+            log.info("分片 403，改用清单地址作 Referer 重试：%s", url[:80])
+            return pngu_fetch.http_get(url,
+                                       referer=sess.final_src or sess.src,
+                                       cookie=sess.cookie)
+
     def segment_bytes(self, sess, idx):
         key = (sess.token, idx)
         hit = self.cache.get(key)
@@ -383,9 +421,7 @@ class HlsProxy(object):
             return hit
         if idx < 0 or idx >= len(sess.segments):
             raise RuntimeError("分片下标越界 %s" % idx)
-        raw, _ = pngu_fetch.http_get(sess.segments[idx],
-                                     referer=sess.referer or sess.src,
-                                     cookie=sess.cookie)
+        raw, _ = self._fetch_segment(sess, idx)
         payload, info = pngu_unwrap.unwrap(raw)
         if info.get("shell"):
             log.debug("剥壳 %s/%d：%d → %d 字节（%s）",
@@ -554,6 +590,39 @@ def _make_handler(proxy):
                                 "再打开 first_segment_url 确认返回的是 TS 而不是 PNG",
                     })
 
+                # 自包含入口：把源 m3u8 地址 base64 编进路径。
+                #   http://<本服务>/hls/u/<b64>.m3u8
+                # 好处是不依赖平台解析链、不依赖任何登记记录，重启即恢复，
+                # 可以直接写进 .strm 文件当播放地址用。
+                if head == "hls" and len(parts) >= 3 and parts[1] == "u":
+                    raw = parts[2].split(".")[0]
+                    src = _b64d(raw)
+                    if not src.lower().startswith(("http://", "https://")):
+                        return _serve_json(self, {
+                            "ok": False,
+                            "error": "路径里的源地址解不出来（应为 base64url 编码的 m3u8 地址）",
+                        }, 400)
+                    prefix = _prefix_of(self, proxy)
+                    sess = proxy.session(raw)
+                    if not sess:
+                        q = urllib.parse.parse_qs(parsed.query)
+                        ref = (q.get("ref") or [""])[0].strip()
+                        try:
+                            # 默认**不发 Referer**：icve/douyinbit 这类站点的
+                            # 防盗链恰恰是「有 Referer 反而 403」，而 curl 默认
+                            # 不发 Referer 能直取。需要 Referer 的站用 ?ref= 指定。
+                            proxy.register(src, referer=ref,
+                                           prefix=prefix, token=raw)
+                        except Exception as e:      # noqa: BLE001
+                            return _serve_json(self, {
+                                "ok": False, "error": str(e)[:300],
+                                "src": src,
+                            }, 502)
+                        sess = proxy.session(raw)
+                    blob = proxy.playlist_bytes(sess, prefix)
+                    return _serve_bytes(
+                        self, blob, "application/vnd.apple.mpegurl")
+
                 if head == "hls" and len(parts) >= 2:
                     tok = parts[1].split(".")[0]
                     sess = proxy.session(tok)
@@ -602,6 +671,22 @@ def _make_handler(proxy):
                     pass
 
     return Handler
+
+
+def _b64e(text):
+    """把源地址编码进 URL 路径：base64url、无 padding、无 `/`。"""
+    raw = text.encode("utf-8") if isinstance(text, str) else text
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64d(token):
+    """还原。解不出来就返回空串，绝不抛。"""
+    try:
+        s = token.strip()
+        pad = "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s + pad).decode("utf-8")
+    except Exception:                               # noqa: BLE001
+        return ""
 
 
 def _prefix_of(handler, proxy):

@@ -19,22 +19,46 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 TS_PACKET = 188
 TS_SYNC = 0x47
 
-# 已知的壳头长度。126 是 4kvms 的实测值 —— 三个真实分片样本
-# (_seg_1012130_0 / _seg_1016642_134 / _seg_845374_1) 剥掉 126 字节后
-# 长度都能被 188 整除，且同步率 1.0000。73 作为历史值保留。
-SHELL_SIZES = (126, 73, 0)
+# 已知的壳头长度（只是「优先试探」，真正的判定靠同步率，见下）：
+#   126 —— 4kvms 三份真实样本（_seg_1012130_0 等）实测
+#    61 —— icve/douyinbit 系（8 签名字节 + 25 IHDR + 28 IDAT，无 IEND）
+#    73 —— 早期的历史值，部分站点仍在使用
+SHELL_SIZES = (126, 61, 73, 0)
 
 # 允许在头部多大范围内滑动搜索同步字节
 SEARCH_WINDOW = 1024
 
+# 同步率阈值。真 TS 每 188 字节必有一个 0x47，实测 1.0000；
+# 随机字节（含真 PNG 图片）命中率约 1/256 ≈ 0.004，两者差三个数量级，
+# 0.85 足够把「壳后 TS」和「真图片」分开，同时容忍偶发丢包。
+SYNC_MIN = 0.85
+
+
+def _ts_sync_rate(body: bytes, n: int = 100) -> float:
+    """从第 0 字节起每 188 字节采一个，统计 0x47 命中率。
+
+    **不能用「长度 % 188 == 0」来判断**：这个判据在真实数据上会把正确的
+    偏移直接跳过 —— icve 系分片末尾有 12 字节残包（最后一个 TS 包被截断），
+    剥掉 61 字节后长度 4,671,812 不整除 188，老代码因此认定「不是 TS」，
+    原样把 PNG 吐给播放器。同步率对残包免疫，这也是 fpkvip 里
+    `_locate_ts` 用的办法。
+    """
+    if not body or len(body) < TS_PACKET * 2:
+        return 0.0
+    samples = body[::TS_PACKET][:n]
+    if len(samples) < 2:
+        return 0.0
+    return samples.count(TS_SYNC) / float(len(samples))
+
 
 def _is_ts(body: bytes) -> bool:
-    """首字节是同步字节，且长度能被 188 整除（允许末尾残包）。"""
+    """首字节是同步字节，且后续 188 步进几乎全是同步字节。
+
+    容许末尾残包（最后一个包被 CDN 截断），这也是真实分片的常态。
+    """
     if not body or body[0] != TS_SYNC:
         return False
-    if len(body) < TS_PACKET * 2:
-        return False
-    return len(body) % TS_PACKET == 0
+    return _ts_sync_rate(body) >= SYNC_MIN
 
 
 def _is_mp4(body: bytes) -> bool:
@@ -46,14 +70,18 @@ def _is_mp4(body: bytes) -> bool:
 
 
 def _align_ts(body: bytes) -> bytes:
-    """在 SEARCH_WINDOW 内找第一个能把长度整除 188 的同步字节位置。"""
+    """在 SEARCH_WINDOW 内找第一个「其后每 188 字节都是 0x47」的位置。
+
+    顺序扫描天然取到最小偏移 —— 最前面几个包是 PAT/PMT，往后剥会把节目表
+    丢掉，播放器找不到 PMT 就黑屏。
+    """
     limit = min(len(body), SEARCH_WINDOW)
     for off in range(limit):
         if body[off] != TS_SYNC:
             continue
-        tail = len(body) - off
-        if tail >= TS_PACKET * 2 and tail % TS_PACKET == 0:
-            return body[off:]
+        tail = body[off:]
+        if _ts_sync_rate(tail) >= SYNC_MIN:
+            return tail
     return b""
 
 

@@ -140,7 +140,7 @@ def _as_int(v, default, lo=None, hi=None):
 class Plugin(BasePlugin):
     plugin_id = "parser.pngunwrap"
     plugin_name = "PNG 壳分片剥离"
-    plugin_version = "0.2.2"
+    plugin_version = "0.2.3"
 
     def __init__(self):
         self._cfg = dict(DEFAULTS)
