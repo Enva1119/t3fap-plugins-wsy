@@ -99,6 +99,24 @@ DEFAULTS = {
 # 所以不能「试一次失败就永久放弃」；但也别每个请求都去扫一遍 sys.modules。
 _MOUNT_RETRY_SEC = 15.0
 
+# 需要做「内存 vs 磁盘」一致性检查的子模块。平台热更新插件时只重新导入
+# plugin 模块，这些模块会一直赖在 sys.modules 里 —— 结果就是新的 plugin.py
+# 去调旧版 HlsProxy，TypeError 之后挂载和接管全都没装上。
+_SUBMODULES = ("pngu_unwrap", "pngu_fetch", "pngu_sign",
+               "pngu_proxy", "pngu_mount", "pngu_hijack")
+
+
+def _disk_version(path):
+    """从源码文件里读 `__version__ = "..."`。读不到返回空串。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("__version__"):
+                    return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    return ""
+
 
 def _snap(obj, limit=1500):
     """把平台传进来的结构压成一行日志 —— 排查就靠它。"""
@@ -331,20 +349,104 @@ class Plugin(BasePlugin):
         self._bootstrap()
         return True
 
-    def _bootstrap(self):
-        """尽力把内建服务 + 平台挂载 + STRM 接管装好；失败只记日志。"""
+    def _bootstrap(self, force=False):
+        """尽力把内建服务 + 平台挂载 + STRM 接管装好；失败只记日志。
+
+        顺序：先确认内存里的子模块和磁盘上的一致（平台热更新只重载 plugin
+        模块，子模块会赖在 sys.modules 里，新旧混用会 TypeError），再用**旧**
+        模块把旧现场拆干净，最后重新装。
+
+        force=True 用于「用户主动 enable」：这时不该被 15 秒重试间隔挡住 ——
+        用户点启用就是在催我们干活，等 15 秒等于又白点一次。
+        """
         try:
             if self._disabled or not self._enabled():
                 return
+            stale = self._stale_modules()
+            if stale:
+                log.warning("检测到子模块与磁盘文件版本不一致：%s。"
+                            "平台热更新只重载了 plugin 模块，这里自动重新加载 —— "
+                            "若仍有异常，请完整重启 T3FAP 容器。", ", ".join(stale))
+                # 先用旧模块把现场拆干净，再 reload，否则新的 _STATE 是空的，
+                # 摘不掉旧路由（会留下两个挂在同一前缀上的 Mount）。
+                self._teardown_quietly()
+                self._reload(stale)
+                force = True
             proxy = self._ensure_proxy()
-            self._try_mount(proxy)
+            self._try_mount(proxy, force=force)
         except Exception as e:                      # noqa: BLE001
             log.warning("启动时初始化未完成（不影响其它插件）：%s: %s",
                         type(e).__name__, e)
 
+    # ---------------------------------------------------------- 模块一致性
+
+    def _stale_modules(self):
+        """返回「内存版本 ≠ 磁盘版本」的子模块名。
+
+        每个子模块末尾都有 `__version__`。老版本没有这个属性，所以升级后
+        第一次检查必然判定为不一致 —— 正好触发一次 reload，把旧代码换掉。
+        """
+        stale = []
+        for name in _SUBMODULES:
+            mod = sys.modules.get(name)
+            if mod is None:
+                continue
+            disk = _disk_version(getattr(mod, "__file__", "")
+                                 or os.path.join(HERE, name + ".py"))
+            mem = str(getattr(mod, "__version__", "") or "")
+            if disk and disk != mem:
+                stale.append("%s(内存 %s / 磁盘 %s)" % (name, mem or "无", disk))
+        return stale
+
+    def _reload(self, stale):
+        """按依赖顺序重新加载。reload 是原子的，失败就保持旧模块继续跑。"""
+        import importlib
+        order = ["pngu_unwrap", "pngu_fetch", "pngu_sign",
+                 "pngu_proxy", "pngu_mount", "pngu_hijack"]
+        done = []
+        for name in order:
+            if not any(name in s for s in stale):
+                continue
+            mod = sys.modules.get(name)
+            if mod is None:
+                continue
+            try:
+                importlib.reload(mod)
+                done.append(name)
+            except Exception as e:                  # noqa: BLE001
+                log.warning("重新加载 %s 失败（继续用旧代码）：%s", name, e)
+        if done:
+            log.info("已重新加载子模块：%s", ", ".join(done))
+
+    def _teardown_quietly(self):
+        """用当前（旧）模块摘掉接管、摘掉挂载、停掉旧实例。全程不抛。"""
+        try:
+            pngu_hijack.unhijack()
+        except Exception:                           # noqa: BLE001
+            pass
+        try:
+            pngu_mount.unmount()
+        except Exception:                           # noqa: BLE001
+            pass
+        proxy, self._proxy = self._proxy, None
+        if proxy is not None:
+            try:
+                proxy.stop()
+            except Exception:                       # noqa: BLE001
+                pass
+        self._mount_tried = False
+        self._mount_at = 0.0
+
     def enable(self, ctx=None):
+        """启用时也重跑一遍初始化。
+
+        「装上了但没生效」最常见的情形就是用户到后台点一下启用 —— 如果这里
+        什么都不做，接管就永远不会被装（register 可能发生在 enable 之前，
+        那时 app 还没建好）。
+        """
         self._disabled = False
         log.info("enable")
+        self._bootstrap(force=True)
         return True
 
     def disable(self, ctx=None):
@@ -379,6 +481,20 @@ class Plugin(BasePlugin):
             except Exception as e:                  # noqa: BLE001
                 log.warning("停止内建服务失败：%s", e)
 
+    def _module_versions(self):
+        """内存 vs 磁盘的模块版本。不一致说明热更新没把子模块换掉。"""
+        out = {}
+        for name in _SUBMODULES:
+            mod = sys.modules.get(name)
+            if mod is None:
+                out[name] = "未加载"
+                continue
+            mem = str(getattr(mod, "__version__", "") or "无")
+            disk = _disk_version(getattr(mod, "__file__", "")
+                                 or os.path.join(HERE, name + ".py")) or "无"
+            out[name] = mem if mem == disk else "%s（磁盘 %s）" % (mem, disk)
+        return out
+
     def health(self, ctx=None):
         # 整体兜底：health 抛异常会让平台判插件不可用甚至装不上，
         # 所以这里任何意外都转成 degraded 文本返回。
@@ -402,6 +518,7 @@ class Plugin(BasePlugin):
                 "service": proxy_health_of(proxy),
                 "mount": pngu_mount.state(),
                 "hijack": pngu_hijack.state(),
+                "modules": self._module_versions(),
                 "wasm": os.path.isfile(wasm),
                 "sdk": _SDK,
                 "diag": pngu_proxy.DIAG.snapshot(),
@@ -583,24 +700,61 @@ class Plugin(BasePlugin):
         return (link, referer, detail)
 
     def _ensure_proxy(self):
-        if self._proxy and self._proxy.running:
+        if self._proxy and getattr(self._proxy, "running", False):
             return self._proxy
         host = str(self._cfg.get("bind_host") or "127.0.0.1").strip()
         port = _as_int(self._cfg.get("listen_port"), 18521, 1024, 65535)
-        proxy = pngu_proxy.HlsProxy(
-            host=host,
-            port=port,
-            cache_mb=_as_int(self._cfg.get("cache_mb"), 64, 4, 4096),
-            cache_ttl=_as_int(self._cfg.get("cache_ttl"), 30, 5, 3600),
-            public_base=str(self._cfg.get("public_base") or "").strip(),
-        )
+        proxy = self._build_proxy(host, port)
         try:
             proxy.start()
         except Exception as e:                      # noqa: BLE001
-            raise pngu_fetch.FetchError(
-                "内建服务启动失败（%s:%d）：%s" % (host, port, e))
+            # 独立端口（18521）起不来**不该拖累挂载与接管**：
+            # /api/strm/pngu 走的是挂在平台上的 ASGI，用的是 proxy 的会话与
+            # 取流逻辑，跟这个监听套接字没关系。以前这里直接 raise，结果
+            # 「端口被占」就把整条播放链路一起废掉，日志里只剩一句
+            # 「启动时初始化未完成」。
+            log.warning("内建服务监听失败（%s:%d）：%s；继续挂到平台端口",
+                        host, port, e)
+            try:
+                proxy.error = "内建服务启动失败：%s" % e
+            except Exception:                       # noqa: BLE001
+                pass
         self._proxy = proxy
         self._try_mount(proxy)
+        return proxy
+
+    def _build_proxy(self, host, port):
+        """构造 HlsProxy，兼容「内存里还是旧版类」的情况。
+
+        旧版 `HlsProxy.__init__` 没有 `public_base` 参数，硬传就是
+        `TypeError: got an unexpected keyword argument 'public_base'` ——
+        这正是日志里那条错误。这里按签名过滤参数，旧版也能构造出来，
+        构造完再把 `public_base` 补上（旧版没这个属性，补上只是多了个字段）。
+        """
+        import inspect
+        want = {
+            "host": host,
+            "port": port,
+            "cache_mb": _as_int(self._cfg.get("cache_mb"), 64, 4, 4096),
+            "cache_ttl": _as_int(self._cfg.get("cache_ttl"), 30, 5, 3600),
+            "public_base": str(self._cfg.get("public_base") or "").strip(),
+        }
+        kw = dict(want)
+        try:
+            params = inspect.signature(pngu_proxy.HlsProxy.__init__).parameters
+            if not any(p.kind == p.VAR_KEYWORD for p in params.values()):
+                dropped = [k for k in kw if k not in params]
+                kw = {k: v for k, v in kw.items() if k in params}
+                if dropped:
+                    log.warning("内存里的 HlsProxy 是旧版，忽略不支持的参数：%s"
+                                "（建议重启 T3FAP 容器以加载新代码）", dropped)
+        except (TypeError, ValueError):
+            kw = {"host": host, "port": port}
+        proxy = pngu_proxy.HlsProxy(**kw)
+        try:
+            proxy.public_base = str(want["public_base"] or "").rstrip("/")
+        except Exception:                           # noqa: BLE001
+            pass
         return proxy
 
     def _try_mount(self, proxy, force=False):

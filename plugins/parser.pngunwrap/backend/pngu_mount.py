@@ -97,15 +97,36 @@ def _build_asgi(proxy, prefix):
         seg_prefix = "%s%s" % (base.rstrip("/"), prefix)
 
         try:
-            code, ctype, blob = await asyncio.to_thread(
-                pngu_proxy.handle_path, proxy, path, "", seg_prefix)
+            # 先问「接管」模块：它自带会话与分片缓存，完全不依赖 HlsProxy，
+            # 即使内存里的 pngu_proxy 是旧版（没有 handle_path）也能工作。
+            import pngu_hijack
+            hit = pngu_hijack.serve(path)
         except Exception as e:                      # noqa: BLE001
-            log.warning("平台内路由处理 %s 失败：%s", path, e)
-            code, ctype, blob = 502, "application/json; charset=utf-8", (
-                '{"ok": false, "error": "%s: %s"}' %
-                (type(e).__name__, str(e).replace('"', "'")[:200])).encode()
+            log.warning("接管路由处理 %s 失败：%s", path, e)
+            hit = None
 
-        st, body, hdrs = pngu_proxy._range_of(blob, headers.get("range", ""))
+        if hit is not None:
+            code, ctype, blob = hit
+        else:
+            try:
+                code, ctype, blob = await asyncio.to_thread(
+                    pngu_proxy.handle_path, proxy, path, "", seg_prefix)
+            except AttributeError as e:
+                # 旧版 pngu_proxy 没有 handle_path —— 只影响 /hls/u/ 手动入口，
+                # STRM 接管那条路不经过这里。
+                log.warning("内建 handle_path 不可用（模块版本过旧）：%s", e)
+                code, ctype, blob = 503, "application/json; charset=utf-8", (
+                    b'{"ok": false, "error": "proxy module too old, restart t3fap"}')
+            except Exception as e:                  # noqa: BLE001
+                log.warning("平台内路由处理 %s 失败：%s", path, e)
+                code, ctype, blob = 502, "application/json; charset=utf-8", (
+                    '{"ok": false, "error": "%s: %s"}' %
+                    (type(e).__name__, str(e).replace('"', "'")[:200])).encode()
+
+        try:
+            st, body, hdrs = pngu_proxy._range_of(blob, headers.get("range", ""))
+        except Exception:                           # noqa: BLE001
+            st, body, hdrs = code, blob, {}
         if st != 206:
             st = code
 
@@ -187,3 +208,8 @@ def unmount():
         log.warning("卸载路由失败（不影响运行）：%s", e)
     finally:
         _STATE.update(mounted=False, prefix="", app="", reason="")
+
+
+# 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
+# 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
+__version__ = "0.4.1"

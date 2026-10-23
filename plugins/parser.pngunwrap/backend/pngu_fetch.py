@@ -275,3 +275,8 @@ def demo_segment():
     fill[2] = 0xFF
     fill[3] = 0x10
     return bytes(pat) + bytes(fill)
+
+
+# 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
+# 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
+__version__ = "0.4.1"

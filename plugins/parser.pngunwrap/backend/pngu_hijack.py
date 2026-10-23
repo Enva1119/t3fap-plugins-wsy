@@ -47,6 +47,8 @@ import logging
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
 
 log = logging.getLogger("pngunwrap.hijack")
 
@@ -81,7 +83,6 @@ _STATE = {
 _LOCK = threading.Lock()
 _VERDICT = {}               # loc -> (expire_ts, dict)
 _ORIG = []                  # [(route, orig_app)]
-_PROXY = [None]             # 当前在用的 Proxy 实例（hijack 时装进来）
 
 
 def state():
@@ -136,9 +137,10 @@ def _token_of(loc):
     """由源地址推出稳定的会话 token。
 
     稳定很重要：播放器刷新清单、多端同看时都会重新请求，如果每次生成新 token，
-    已经发出去的分片地址就全失效了。16 位十六进制足够避免碰撞。
+    已经发出去的分片地址就全失效了。前缀 `s` + 15 位十六进制，落在
+    `/api/strm/pngu/seg/s1a2b…/<n>`，和 HlsProxy 自己的 token 不会撞。
     """
-    return hashlib.sha1(loc.encode("utf-8", "replace")).hexdigest()[:16]
+    return "s" + hashlib.sha1(loc.encode("utf-8", "replace")).hexdigest()[:15]
 
 
 # ---------------------------------------------------------------- 探测
@@ -369,18 +371,11 @@ async def _decide_and_send(send, scope, st):
 
     # —— 确认带壳：接管这条流 ——
     try:
-        proxy = _PROXY[0]
-        if proxy is None:
-            raise RuntimeError("插件代理实例尚未就绪")
         tok = _token_of(loc)
-        sess = proxy.session(tok)
+        sess = sess_get(tok)
         if sess is None:
-            proxy.register(loc, referer="", cookie="",
-                           prefix=SELF_PREFIX, token=tok)
-            sess = proxy.session(tok)
-        if sess is None:
-            raise RuntimeError("建立会话失败")
-        blob = proxy.playlist_bytes(sess, SELF_PREFIX)
+            sess = await asyncio.to_thread(sess_build, tok, loc)
+        blob = sess.playlist.encode("utf-8")
     except Exception as e:                          # noqa: BLE001
         _bump("fail")
         _note("改写清单失败，放行：%s: %s" % (type(e).__name__, str(e)[:140]))
@@ -409,6 +404,307 @@ async def _decide_and_send(send, scope, st):
     await send({"type": "http.response.body", "body": blob})
 
 
+# ---------------------------------------------------------------- 自包含会话
+# 接管这条链路**故意不依赖 HlsProxy**。剥壳真正需要的只有三件事：拉清单、
+# 拉分片、剥壳。复用 HlsProxy 会带来两个真实的坑，都在这台机器上踩过：
+#   ① 平台热更新只重载 plugin 模块，内存里的 pngu_proxy 还是旧版类，
+#      `HlsProxy(public_base=…)` 直接 TypeError，内建服务起不来；
+#   ② 更旧的版本连 `handle_path` 都没有，挂上去的 ASGI 一调就崩。
+# 所以这里自带会话表、分片缓存和清单改写，只用 pngu_fetch + pngu_unwrap
+# 这两个纯函数模块。18521 内建服务继续保留，但接管不再依赖它。
+
+SEG_TTL = 60                    # 分片缓存秒数
+SEG_MAX_BYTES = 96 * 1024 * 1024
+
+_SESS = {}
+_SEG = {}
+_SEG_BYTES = [0]
+_SEG_LOCK = threading.Lock()
+
+
+class _Sess(object):
+    __slots__ = ("tok", "src", "final", "text", "segs", "keys", "maps",
+                 "playlist", "touched", "error")
+
+    def __init__(self, tok, src):
+        self.tok = tok
+        self.src = src
+        self.final = src
+        self.text = ""
+        self.segs = []
+        self.keys = []
+        self.maps = []
+        self.playlist = ""
+        self.touched = time.time()
+        self.error = ""
+
+
+def _attr(line):
+    i = line.find('URI="')
+    if i < 0:
+        return ""
+    j = line.find('"', i + 5)
+    return "" if j < 0 else line[i + 5:j]
+
+
+def _replace(line, new_uri):
+    i = line.find('URI="')
+    if i < 0:
+        return line
+    j = line.find('"', i + 5)
+    return line if j < 0 else line[:i + 5] + new_uri + line[j:]
+
+
+def _is_ours(tok):
+    """我们的 token 是 `s` + 15 位十六进制，和 HlsProxy 的 token 不会撞。"""
+    if len(tok) != 16 or not tok.startswith("s"):
+        return False
+    return all(c in "0123456789abcdef" for c in tok[1:])
+
+
+def sess_get(tok):
+    with _SEG_LOCK:
+        s = _SESS.get(tok)
+    if s is not None:
+        s.touched = time.time()
+    return s
+
+
+def _sess_put(sess):
+    with _SEG_LOCK:
+        _SESS[sess.tok] = sess
+        if len(_SESS) > 200:
+            old = sorted(_SESS.values(), key=lambda x: x.touched)[:50]
+            for s in old:
+                _SESS.pop(s.tok, None)
+
+
+def _render(sess):
+    """把上游清单改写成指向本服务。分片用**根相对路径**，不带 host ——
+    播放器按清单地址自己补全，局域网 IP / DDNS 域名 / 反代端口都能共用。"""
+    out = []
+    ki = mi = si = 0
+    for raw in sess.text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("#ext-x-key") or low.startswith("#ext-x-session-key"):
+            if _attr(line) and ki < len(sess.keys):
+                line = _replace(line, "%s/key/%s/%d" % (SELF_PREFIX, sess.tok, ki))
+            ki += 1
+            out.append(line)
+            continue
+        if low.startswith("#ext-x-map"):
+            if _attr(line) and mi < len(sess.maps):
+                line = _replace(line, "%s/key/%s/m%d" % (SELF_PREFIX, sess.tok, mi))
+            mi += 1
+            out.append(line)
+            continue
+        if line.startswith("#"):
+            out.append(line)
+            continue
+        out.append("%s/seg/%s/%d" % (SELF_PREFIX, sess.tok, si))
+        si += 1
+    sess.playlist = "\n".join(out) + "\n"
+    return sess.playlist
+
+
+def sess_build(tok, src):
+    """拉清单、解析、渲染。失败抛异常，由调用方决定是否放行。"""
+    import pngu_fetch
+
+    blob, _ctype, final = pngu_fetch.http_get_ex(src)
+    text = blob.decode("utf-8", "replace")
+    if "#EXTM3U" not in text:
+        raise RuntimeError("源地址返回的不是 m3u8（前 60 字节：%s）"
+                           % text[:60].replace("\n", " "))
+    if "#EXT-X-STREAM-INF" in text:
+        raise RuntimeError("主清单（多码率），本模块不接管")
+
+    base = final or src
+    segs, keys, maps = [], [], []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("#ext-x-key") or low.startswith("#ext-x-session-key"):
+            uri = _attr(line)
+            if uri:
+                keys.append(_join(base, uri))
+            continue
+        if low.startswith("#ext-x-map"):
+            uri = _attr(line)
+            if uri:
+                maps.append(_join(base, uri))
+            continue
+        if line.startswith("#"):
+            continue
+        segs.append(_join(base, line))
+    if not segs:
+        raise RuntimeError("清单里没有分片")
+
+    sess = _Sess(tok, src)
+    sess.final = base
+    sess.text = text
+    sess.segs = segs
+    sess.keys = keys
+    sess.maps = maps
+    _render(sess)
+    _sess_put(sess)
+    log.info("接管会话就绪 %s：%d 片，base=%s", tok, len(segs), base[:80])
+    return sess
+
+
+def _fetch_any(url, referer=""):
+    """取字节。带 Referer 反而 403 的站很常见（dc.xhscdn / icve 系实测），
+    所以默认不发；401/403 再试着补一个。"""
+    import pngu_fetch
+    try:
+        blob, _ct, _f = pngu_fetch.http_get_ex(url, referer=referer, timeout=25)
+        return blob
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403) and referer:
+            blob, _ct, _f = pngu_fetch.http_get_ex(url, timeout=25)
+            return blob
+        raise
+
+
+def _seg_put(key, blob):
+    now = time.time()
+    with _SEG_LOCK:
+        old = _SEG.get(key)
+        if old:
+            _SEG_BYTES[0] -= len(old[1])
+        _SEG[key] = (now + SEG_TTL, blob)
+        _SEG_BYTES[0] += len(blob)
+        if _SEG_BYTES[0] > SEG_MAX_BYTES or len(_SEG) > 4000:
+            for k in sorted(_SEG, key=lambda x: _SEG[x][0])[:max(1, len(_SEG) // 4)]:
+                _SEG_BYTES[0] -= len(_SEG[k][1])
+                _SEG.pop(k, None)
+
+
+def seg_bytes(tok, idx):
+    import pngu_unwrap
+    key = (tok, idx)
+    now = time.time()
+    with _SEG_LOCK:
+        item = _SEG.get(key)
+    if item and item[0] > now:
+        return item[1]
+    sess = sess_get(tok)
+    if sess is None:
+        raise KeyError(tok)
+    if not (0 <= idx < len(sess.segs)):
+        raise IndexError(idx)
+
+    url = sess.segs[idx]
+    try:
+        raw = _fetch_any(url, sess.final)
+    except urllib.error.HTTPError as e:
+        # 上游分片地址有时效。长片看到一半 token 过期，分片就全变 401/403/404。
+        # 这时**重新要一次清单**：src 是 T3FAP 门票地址的话，平台会 302 到当次
+        # 有效的新上游地址，分片地址随之刷新。只重试一次，不会打转。
+        if e.code not in (401, 403, 404):
+            raise
+        log.info("分片 %d 返回 %s，重取清单刷新上游地址：%s", idx, e.code, url[:80])
+        _bump("refresh")
+        sess = sess_build(tok, sess.src)
+        if idx >= len(sess.segs):
+            raise
+        new_url = sess.segs[idx]
+        if new_url == url:
+            raise
+        _note("上游地址过期，已刷新清单（片 %d）" % idx)
+        raw = _fetch_any(new_url, sess.final)
+
+    payload, info = pngu_unwrap.unwrap(raw)
+    if info.get("shell"):
+        log.info("剥壳 %s/%d：%d → %d 字节（壳 %s，%s）", tok, idx,
+                 len(raw), len(payload), info.get("shell"), info.get("kind"))
+    _seg_put(key, payload)
+    return payload
+
+
+def key_bytes(tok, idx):
+    sess = sess_get(tok)
+    if sess is None:
+        raise KeyError(tok)
+    if idx.startswith("m"):
+        seq, i = sess.maps, int(idx[1:])
+    else:
+        seq, i = sess.keys, int(idx)
+    if not (0 <= i < len(seq)):
+        raise IndexError(idx)
+    return _fetch_any(seq[i], sess.final)
+
+
+def serve(path):
+    """在挂载的 ASGI 里优先处理我们自己的路径。
+
+    返回 (status, content_type, body)，不是我们的路径返回 None，
+    由调用方继续交给原来的 handle_path。
+    """
+    parts = [p for p in (path or "").split("/") if p]
+    if len(parts) < 2:
+        return None
+
+    head = parts[0]
+    if head == "hls" and len(parts) >= 2:
+        tok = parts[1].split(".")[0]
+        if not _is_ours(tok):
+            return None
+        sess = sess_get(tok)
+        if sess is None:
+            return (404, "application/json; charset=utf-8",
+                    b'{"ok": false, "error": "session gone"}')
+        return 200, "application/vnd.apple.mpegurl", sess.playlist.encode()
+
+    if head == "seg" and len(parts) >= 3:
+        tok = parts[1]
+        if not _is_ours(tok):
+            return None
+        try:
+            idx = int(parts[2])
+        except ValueError:
+            return 400, "application/json; charset=utf-8", b'{"ok": false}'
+        try:
+            return 200, "video/mp2t", seg_bytes(tok, idx)
+        except KeyError:
+            return (404, "application/json; charset=utf-8",
+                    b'{"ok": false, "error": "session gone"}')
+        except Exception as e:                      # noqa: BLE001
+            _bump("fail")
+            msg = "%s: %s" % (type(e).__name__, str(e)[:160])
+            _note("取分片失败 %s/%d：%s" % (tok, idx, msg))
+            log.warning("取分片失败 %s/%d：%s（上游 %s）", tok, idx, msg,
+                        _seg_url(tok, idx))
+            return (502, "application/json; charset=utf-8",
+                    ('{"ok": false, "error": "%s"}'
+                     % msg.replace('"', "'")).encode())
+
+    if head == "key" and len(parts) >= 3:
+        tok = parts[1]
+        if not _is_ours(tok):
+            return None
+        try:
+            return 200, "application/octet-stream", key_bytes(tok, parts[2])
+        except Exception as e:                      # noqa: BLE001
+            return (502, "application/json; charset=utf-8",
+                    ('{"ok": false, "error": "%s"}'
+                     % str(e)[:160].replace('"', "'")).encode())
+
+    return None
+
+
+def _seg_url(tok, idx):
+    sess = sess_get(tok)
+    if sess and 0 <= idx < len(sess.segs):
+        return sess.segs[idx][:110]
+    return "?"
+
+
 # ---------------------------------------------------------------- 安装 / 卸载
 
 def _eligible(route):
@@ -434,7 +730,6 @@ def hijack(proxy):
         return True, "已接管 %d 条路由" % len(_ORIG)
     try:
         import pngu_mount
-        _PROXY[0] = proxy
         apps = pngu_mount.find_apps()
         if not apps:
             _STATE["reason"] = "没在 sys.modules 里找到 FastAPI 应用"
@@ -486,8 +781,12 @@ def unhijack():
         except Exception:                           # noqa: BLE001
             pass
     _ORIG.clear()
-    _PROXY[0] = None
     with _LOCK:
         _STATE.update(hijacked=0, routes=[], reason="")
     if n:
         log.info("已还原 %d 条 STRM 路由", n)
+
+
+# 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
+# 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
+__version__ = "0.4.1"
