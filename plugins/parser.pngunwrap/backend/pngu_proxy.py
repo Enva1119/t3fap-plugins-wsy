@@ -43,7 +43,8 @@ class Session(object):
     """一条播放会话：源清单地址 + 拆出来的分片表。"""
 
     __slots__ = ("token", "src", "referer", "cookie", "segments", "keys",
-                 "maps", "playlist", "created", "touched", "error")
+                 "maps", "playlist", "created", "touched", "error",
+                 "raw_text", "render_prefix", "built")
 
     def __init__(self, token, src, referer="", cookie=""):
         self.token = token
@@ -57,6 +58,9 @@ class Session(object):
         self.created = time.time()
         self.touched = time.time()
         self.error = ""
+        self.raw_text = None    # 源清单原文（None = demo 源）
+        self.render_prefix = None   # 上次渲染用的 base，变了就重渲染
+        self.built = False
 
 
 class SegmentCache(object):
@@ -150,9 +154,10 @@ class HlsProxy(object):
     """插件内建 HTTP 服务（惰性启动，进程内线程）。"""
 
     def __init__(self, host="127.0.0.1", port=18521,
-                 cache_mb=64, cache_ttl=30):
+                 cache_mb=64, cache_ttl=30, public_base=""):
         self.host = host
         self.port = int(port)
+        self.public_base = str(public_base or "").rstrip("/")
         self.cache = SegmentCache(cache_mb, cache_ttl)
         self.sessions = {}
         self.lock = threading.Lock()
@@ -267,11 +272,11 @@ class HlsProxy(object):
     def _build_playlist(self, sess, prefix):
         # demo 源：不拉远端，直接给内置清单（只用来验证链路能否打通）
         if sess.src.startswith("demo://"):
-            sess.playlist = pngu_fetch.demo_playlist(prefix)
-            sess.segments = ["%s/seg/demo/0" % prefix.rstrip("/")]
+            sess.raw_text = None
             sess.keys = []
             sess.maps = []
-            return sess.playlist
+            sess.built = True
+            return self._render(sess, prefix)
 
         txt = pngu_fetch.http_text(sess.src, referer=sess.referer,
                                    cookie=sess.cookie)
@@ -280,31 +285,72 @@ class HlsProxy(object):
                                % txt[:80].replace("\n", " "))
 
         base = sess.src
-        out = []
         segs, keys, maps = [], [], []
-
         for raw in txt.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-SESSION-KEY"):
+                uri = _attr_uri(line)
+                if uri:
+                    keys.append(urllib.parse.urljoin(base, uri))
+                continue
+            if line.startswith("#EXT-X-MAP"):
+                uri = _attr_uri(line)
+                if uri:
+                    maps.append(urllib.parse.urljoin(base, uri))
+                continue
+            if line.startswith("#"):
+                continue
+            segs.append(urllib.parse.urljoin(base, line))
+
+        if not segs:
+            raise RuntimeError("清单里没有分片")
+
+        sess.raw_text = txt
+        sess.segments = segs
+        sess.keys = keys
+        sess.maps = maps
+        sess.built = True
+        return self._render(sess, prefix)
+
+    def _render(self, sess, prefix):
+        """按「当前客户端实际用的 base」现场生成清单。
+
+        为什么不在建会话时定死：同一个会话会被不同客户端用不同地址访问
+        （127.0.0.1 / 局域网 IP / DDNS 域名）。建会话时还看不出客户端会
+        从哪进来，写死就会生成 0.0.0.0 或 127.0.0.1 这种播放器打不开的地址。
+        prefix 传空串时输出根相对路径（/seg/...），由播放器自己按清单地址补全
+        —— 这是最不容易出错的形式。
+        """
+        base = (prefix or "").rstrip("/")
+
+        if sess.raw_text is None:
+            sess.playlist = pngu_fetch.demo_playlist(base)
+            sess.segments = ["%s/seg/demo/0" % base]
+            sess.render_prefix = base
+            return sess.playlist
+
+        out = []
+        ki = mi = si = 0
+        for raw in sess.raw_text.splitlines():
             line = raw.strip()
             if not line:
                 continue
 
             if line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-SESSION-KEY"):
-                uri = _attr_uri(line)
-                if uri:
-                    keys.append(urllib.parse.urljoin(base, uri))
+                if _attr_uri(line) and ki < len(sess.keys):
                     line = _replace_uri(
-                        line, "%s/key/%s/%d" % (prefix.rstrip("/"),
-                                                sess.token, len(keys) - 1))
+                        line, "%s/key/%s/%d" % (base, sess.token, ki))
+                ki += 1
                 out.append(line)
                 continue
 
             if line.startswith("#EXT-X-MAP"):
-                uri = _attr_uri(line)
-                if uri:
-                    maps.append(urllib.parse.urljoin(base, uri))
+                if _attr_uri(line) and mi < len(sess.maps):
                     line = _replace_uri(
-                        line, "%s/key/%s/m%d" % (prefix.rstrip("/"),
-                                                 sess.token, len(maps) - 1))
+                        line, "%s/key/%s/m%d" % (base, sess.token, mi))
+                mi += 1
                 out.append(line)
                 continue
 
@@ -312,25 +358,21 @@ class HlsProxy(object):
                 out.append(line)
                 continue
 
-            # 普通分片行
-            segs.append(urllib.parse.urljoin(base, line))
-            out.append("%s/seg/%s/%d" % (prefix.rstrip("/"), sess.token,
-                                         len(segs) - 1))
+            out.append("%s/seg/%s/%d" % (base, sess.token, si))
+            si += 1
 
-        if not segs:
-            raise RuntimeError("清单里没有分片")
-
-        sess.segments = segs
-        sess.keys = keys
-        sess.maps = maps
         sess.playlist = "\n".join(out) + "\n"
+        sess.render_prefix = base
         return sess.playlist
 
     def playlist_bytes(self, sess, prefix):
         """拿清单字节；没有就现场构建（HEAD 也需要真实长度）。"""
-        if not sess.playlist:
+        base = (prefix or "").rstrip("/")
+        if not sess.built:
             self._build_playlist(sess, prefix)
-        return sess.playlist.encode("utf-8")
+        elif sess.render_prefix != base:
+            self._render(sess, prefix)
+        return (sess.playlist or "").encode("utf-8")
 
     # ------------------------------------------------------------ 取字节
 
@@ -484,6 +526,34 @@ def _make_handler(proxy):
                     return _serve_json(self, {"health": proxy_health(proxy),
                                               "diag": DIAG.snapshot()})
 
+                # 脱离平台自测：/__test?url=<m3u8> 直接建一个会话，
+                # 返回可播放的清单地址，用浏览器就能验证整条剥壳链路。
+                if head == "__test":
+                    q = urllib.parse.parse_qs(parsed.query)
+                    src = (q.get("url") or [""])[0].strip()
+                    if not src:
+                        return _serve_json(self, {
+                            "ok": False,
+                            "error": "用法：/__test?url=<m3u8 地址>",
+                        }, 400)
+                    prefix = _prefix_of(self, proxy)
+                    try:
+                        url = proxy.register(src, referer=src, prefix=prefix)
+                    except Exception as e:          # noqa: BLE001
+                        return _serve_json(self, {"ok": False,
+                                                  "error": str(e)[:300]}, 502)
+                    tok = url.rsplit("/", 1)[-1].split(".")[0]
+                    sess = proxy.session(tok)
+                    segs = list(sess.segments) if sess else []
+                    return _serve_json(self, {
+                        "ok": True,
+                        "playlist_url": url,
+                        "segments": len(segs),
+                        "first_segment_url": segs[0] if segs else "",
+                        "next": "先打开 playlist_url 确认分片地址已被改写成本服务，"
+                                "再打开 first_segment_url 确认返回的是 TS 而不是 PNG",
+                    })
+
                 if head == "hls" and len(parts) >= 2:
                     tok = parts[1].split(".")[0]
                     sess = proxy.session(tok)
@@ -537,10 +607,12 @@ def _make_handler(proxy):
 def _prefix_of(handler, proxy):
     """拼给客户端用的 base 前缀。
 
-    绑定在回环地址时用 127.0.0.1（平台代理与插件同容器，稳定可达）；
-    绑定 0.0.0.0 时用请求自己的 Host，这样 direct 模式下播放器拿到的
-    就是它实际访问的地址。
+    顺序：显式 public_base（DDNS / 反代路径场景）> 回环绑定用 127.0.0.1
+    （平台代理与插件同容器，稳定可达）> 绑定 0.0.0.0 时用请求自己的 Host
+    （direct 模式下播放器拿到的就是它实际访问的地址）。
     """
+    if proxy.public_base:
+        return proxy.public_base
     if proxy.host in ("127.0.0.1", "localhost"):
         return "http://127.0.0.1:%d" % proxy.port
     host = handler.headers.get("Host") or "127.0.0.1:%d" % proxy.port
@@ -551,10 +623,29 @@ def proxy_health(proxy):
     return {
         "ok": proxy.running,
         "bind": "%s:%d" % (proxy.host, proxy.port),
+        "public_base": proxy.public_base or "(按请求 Host 自动)",
         "sessions": len(proxy.sessions),
         "cache": proxy.cache.stats(),
         "error": proxy.error,
     }
+
+
+def guess_local_ip():
+    """探测本机在局域网里的 IP（不真的发包，只让内核选一次出口地址）。
+
+    绑定 0.0.0.0 时服务端不知道自己在外面该叫什么，用它兜底比写 0.0.0.0 强。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:                               # noqa: BLE001
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:                           # noqa: BLE001
+            return ""
+    finally:
+        s.close()
 
 
 def find_free_port(host, start):

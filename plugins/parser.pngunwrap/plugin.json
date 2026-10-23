@@ -1,7 +1,7 @@
 {
   "id": "parser.pngunwrap",
   "name": "PNG 壳分片剥离",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "category": "parser",
   "description": "把伪装成 PNG 的 HLS 分片剥回可播放的 TS。插件内建一个进程内 HLS 反代，平台代理或播放器访问它时现场剥壳，不需要改动任何现有插件。优先级 8（T3FAP 里数值越小越优先，排在 4k 的 25 之前），只接管 4k 来源，其余一律放行。",
   "core_version": ">=1.0.0 <2.0.0",
@@ -107,12 +107,12 @@
       "type": "select",
       "required": false,
       "default": "proxy",
-      "description": "proxy = 平台代拉（零部署改动，推荐）；direct = 播放器直连插件端口，需要在 compose 里把端口映射出来。",
+      "description": "proxy（默认，推荐）：平台在容器内自己来拉流，对外仍然只有 T3FAP 的统一端口，不需要端口映射，也不影响其它平台播放。direct：让播放器直接访问插件端口，才需要额外映射端口，且删插件后要重建 STRM。",
       "secret": false,
       "group": "服务",
       "options": [
-        { "value": "proxy", "label": "proxy：平台代理转发" },
-        { "value": "direct", "label": "direct：播放器直连" }
+        { "value": "proxy", "label": "proxy：平台代理转发（走统一端口，推荐）" },
+        { "value": "direct", "label": "direct：播放器直连（需额外端口）" }
       ]
     },
     {
@@ -121,12 +121,12 @@
       "type": "select",
       "required": false,
       "default": "127.0.0.1",
-      "description": "proxy 模式用 127.0.0.1；direct 模式要改 0.0.0.0 并映射端口。",
+      "description": "这是插件内建服务的监听地址，不是 T3FAP 的端口。默认 127.0.0.1 只允许容器内部访问，不占对外端口、不需要映射、不影响 8521。只有选了 direct 才需要改成 0.0.0.0（0.0.0.0 也能被 127.0.0.1 访问，只是多暴露了一个接口）。",
       "secret": false,
       "group": "服务",
       "options": [
-        { "value": "127.0.0.1", "label": "127.0.0.1" },
-        { "value": "0.0.0.0", "label": "0.0.0.0" }
+        { "value": "127.0.0.1", "label": "127.0.0.1（仅容器内，推荐）" },
+        { "value": "0.0.0.0", "label": "0.0.0.0（direct 方案用）" }
       ]
     },
     {

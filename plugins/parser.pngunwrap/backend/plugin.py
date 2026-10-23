@@ -140,7 +140,7 @@ def _as_int(v, default, lo=None, hi=None):
 class Plugin(BasePlugin):
     plugin_id = "parser.pngunwrap"
     plugin_name = "PNG 壳分片剥离"
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
 
     def __init__(self):
         self._cfg = dict(DEFAULTS)
@@ -238,29 +238,38 @@ class Plugin(BasePlugin):
                         group="取流"),
             ConfigField(key="access_mode", label="交给平台的方式", type="select",
                         default="proxy",
-                        description="proxy = 平台代拉（零部署改动，推荐）；"
-                                    "direct = 播放器直连插件端口，需要在 "
-                                    "compose 里把端口映射出来。",
+                        description="proxy（默认，推荐）：平台在容器内自己来拉流，"
+                                    "对外仍然只有 T3FAP 的统一端口，不需要端口映射，"
+                                    "也不影响其它平台播放。direct：让播放器直接访问"
+                                    "插件端口，才需要额外映射端口，且删插件后要重建 STRM。",
                         group="服务",
                         options=[
-                            {"value": "proxy", "label": "proxy：平台代理转发"},
-                            {"value": "direct", "label": "direct：播放器直连"},
+                            {"value": "proxy",
+                             "label": "proxy：平台代理转发（走统一端口，推荐）"},
+                            {"value": "direct",
+                             "label": "direct：播放器直连（需额外端口）"},
                         ]),
             ConfigField(key="bind_host", label="监听地址", type="select",
                         default="127.0.0.1",
-                        description="proxy 模式用 127.0.0.1；direct 模式要改 "
-                                    "0.0.0.0 并映射端口。",
+                        description="这是插件内建服务的监听地址，不是 T3FAP 的端口。"
+                                    "默认 127.0.0.1 只允许容器内部访问，不占对外端口、"
+                                    "不需要映射、不影响 8521。只有选了 direct 才需要改成 "
+                                    "0.0.0.0（0.0.0.0 也能被 127.0.0.1 访问，只是多暴露"
+                                    "了一个接口）。",
                         group="服务",
-                        options=[{"value": "127.0.0.1", "label": "127.0.0.1"},
-                                 {"value": "0.0.0.0", "label": "0.0.0.0"}]),
+                        options=[{"value": "127.0.0.1",
+                                  "label": "127.0.0.1（仅容器内，推荐）"},
+                                 {"value": "0.0.0.0",
+                                  "label": "0.0.0.0（direct 方案用）"}]),
             ConfigField(key="listen_port", label="监听端口", type="text",
                         default="18521",
-                        description="被占用时自动往后顺延最多 10 个。",
+                        description="插件内建服务的端口，只在容器内部使用，"
+                                    "和 T3FAP 的 8521 互不影响。被占用时自动往后顺延。",
                         group="服务"),
             ConfigField(key="public_base", label="对外地址", type="text",
                         default="",
-                        description="仅 direct 模式需要，例如 "
-                                    "http://192.168.1.10:18521。留空则用请求头。",
+                        description="仅在 direct 模式、或经过 DDNS/反代需要指定对外地址时填写，"
+                                    "例如 http://192.168.1.10:18521。留空则按请求的实际 Host 生成。",
                         group="服务"),
             ConfigField(key="cache_mb", label="分片缓存上限（MB）", type="text",
                         default="64",
@@ -519,6 +528,7 @@ class Plugin(BasePlugin):
             port=port,
             cache_mb=_as_int(self._cfg.get("cache_mb"), 64, 4, 4096),
             cache_ttl=_as_int(self._cfg.get("cache_ttl"), 30, 5, 3600),
+            public_base=str(self._cfg.get("public_base") or "").strip(),
         )
         try:
             proxy.start()
@@ -529,13 +539,27 @@ class Plugin(BasePlugin):
         return proxy
 
     def _client_prefix(self, proxy):
-        """给播放器/平台代理用的 base 前缀。"""
+        """返回给平台的「流地址」用的绝对 base。
+
+        优先级：public_base > 绑定地址（非通配）> direct 模式探测本机局域网 IP
+        > 127.0.0.1。
+        注意这只决定**清单地址本身**；清单里分片的地址由每个请求自己的 Host
+        头现场决定（见 pngu_proxy._prefix_of / _render），所以局域网 IP 和
+        DDNS 域名可以共用同一份会话。
+        """
         public = str(self._cfg.get("public_base") or "").strip().rstrip("/")
         if public:
             return public
+
+        host = str(proxy.host or "").strip()
+        if host and host not in ("0.0.0.0", "::"):
+            return "http://%s:%d" % (host, proxy.port)
+
         mode = str(self._cfg.get("access_mode") or "proxy").lower()
-        if mode == "direct" and proxy.host not in ("127.0.0.1", "localhost"):
-            return "http://%s:%d" % (proxy.host, proxy.port)
+        if mode == "direct":
+            ip = pngu_proxy.guess_local_ip()
+            if ip:
+                return "http://%s:%d" % (ip, proxy.port)
         return "http://127.0.0.1:%d" % proxy.port
 
     def _enabled(self):
