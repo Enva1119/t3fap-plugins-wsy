@@ -85,13 +85,37 @@ _LOCK = threading.Lock()
 _VERDICT = {}               # loc -> (expire_ts, dict)
 _ORIG = []                  # [(route, orig_app)]
 
+# ---- 内存回收参数 ----
+# NAS 上内存是硬约束（4 GB 机器上还跑着影视转码），插件不能只涨不降。
+# 三张表都有上限，另外有个后台清扫线程：**光靠「写入时顺便淘汰」不够**，
+# 播放器关掉之后不会再有写入，过期分片会一直留在内存里。
+SESS_IDLE = 1800            # 会话闲置多久回收（秒）
+SWEEP_SEC = 30              # 后台清扫间隔（秒）
+_REAPER = [None]            # 后台清扫线程（惰性启动，没东西可扫就自己退出）
+_WAKE = threading.Event()   # 叫醒清扫线程（停用时立刻退出，不必等满一个周期）
+
 
 def state():
-    """给 health / 诊断接口看的接管状态。"""
+    """给 health / 诊断接口看的接管状态（含内存占用）。"""
     with _LOCK:
         s = dict(_STATE)
         s["routes"] = list(_STATE["routes"])
-    s["cache"] = len(_VERDICT)
+        verdict = len(_VERDICT)
+    # _SEG / _SESS 用 _SEG_LOCK 保护，跟 _LOCK 分开取，避免嵌套死锁
+    with _SEG_LOCK:
+        seg_n = len(_SEG)
+        sess_n = len(_SESS)
+        seg_bytes = _SEG_BYTES[0]
+    s["cache"] = verdict
+    s["mem"] = {
+        "verdict": verdict,
+        "segments": seg_n,
+        "sessions": sess_n,
+        "cache_mb": round(seg_bytes / 1048576.0, 1),
+        "cache_max_mb": SEG_MAX_BYTES // 1048576,
+        "seg_ttl": SEG_TTL,
+        "reaper": bool(_REAPER[0] is not None and _REAPER[0].is_alive()),
+    }
     return s
 
 
@@ -132,6 +156,7 @@ def _cache_put(loc, val):
                 for k in list(_VERDICT)[:VERDICT_MAX // 4]:
                     _VERDICT.pop(k, None)
         _VERDICT[loc] = (now + VERDICT_TTL, val)
+    _ensure_reaper()
 
 
 def _token_of(loc):
@@ -423,6 +448,103 @@ _SEG_BYTES = [0]
 _SEG_LOCK = threading.Lock()
 
 
+def configure(cache_mb=None, cache_ttl=None):
+    """把插件配置里的缓存上限/保留时长同步到这条链路。
+
+    内建服务（HlsProxy）和接管链路各有一份缓存，用同一组配置才不会出现
+    「界面写 64 MB，实际占了 96 MB」这种对不上的情况。
+    """
+    global SEG_TTL, SEG_MAX_BYTES
+    try:
+        if cache_mb:
+            SEG_MAX_BYTES = max(8, int(cache_mb)) * 1024 * 1024
+        if cache_ttl:
+            SEG_TTL = max(10, int(cache_ttl))
+    except Exception:                               # noqa: BLE001
+        pass
+    return {"seg_ttl": SEG_TTL, "seg_max_mb": SEG_MAX_BYTES // 1048576}
+
+
+def _sweep(now=None, force=False):
+    """清掉过期分片、闲置会话、过期判定。返回释放的字节数。
+
+    只扫「已经过期」的项，不动还在用的 —— 播放中途把分片删掉会让播放器
+    狂重试。`force=True` 时全清（停用插件/接管卸载时用）。
+    """
+    now = time.time() if now is None else now
+    freed = 0
+    with _SEG_LOCK:
+        if force:
+            for blob in _SEG.values():
+                freed += len(blob[1])
+            _SEG.clear()
+        else:
+            dead = [k for k, item in _SEG.items() if item[0] < now]
+            for k in dead:
+                freed += len(_SEG[k][1])
+                _SEG.pop(k, None)
+        if force:
+            _SESS.clear()
+        else:
+            idle = [t for t, s in _SESS.items()
+                    if now - getattr(s, "touched", now) > SESS_IDLE]
+            for t in idle:
+                _SESS.pop(t, None)
+        # 顺手重算，防止长期增删出现计数漂移
+        _SEG_BYTES[0] = sum(len(b) for _e, b in _SEG.values())
+    with _LOCK:
+        if force:
+            _VERDICT.clear()
+        else:
+            for k in [k for k, (exp, _v) in _VERDICT.items() if exp < now]:
+                _VERDICT.pop(k, None)
+    return freed
+
+
+def _reaper_loop():
+    while True:
+        # 用 Event 而不是 time.sleep：停用插件时能立刻叫醒它退出，
+        # 不用让这个线程干等满一个清扫周期。
+        _WAKE.wait(SWEEP_SEC)
+        _WAKE.clear()
+        try:
+            _sweep()
+        except Exception as e:                      # noqa: BLE001
+            log.warning("内存清扫异常（不影响播放）：%s", e)
+        # 三个表都空了就退出，别让线程常驻
+        with _SEG_LOCK:
+            empty = not _SEG and not _SESS
+        with _LOCK:
+            empty = empty and not _VERDICT
+        if empty:
+            with _SEG_LOCK:
+                if not _SEG and not _SESS:
+                    _REAPER[0] = None
+                    return
+
+
+def _ensure_reaper():
+    """惰性启动后台清扫线程（有缓存才起，空了就自己退）。"""
+    t = _REAPER[0]
+    if t is not None and t.is_alive():
+        return
+    try:
+        t = threading.Thread(target=_reaper_loop, name="pngu-reaper", daemon=True)
+        _REAPER[0] = t
+        t.start()
+    except Exception as e:                          # noqa: BLE001
+        log.info("清扫线程启动失败（不影响播放）：%s", e)
+
+
+def release():
+    """立刻释放全部分片/会话/判定缓存。停用插件、摘掉接管时调用。"""
+    with _SEG_LOCK:
+        nseg, nsess = len(_SEG), len(_SESS)
+    _sweep(force=True)
+    _WAKE.set()                     # 让清扫线程立刻醒来发现「没事可做」并退出
+    return {"segments": nseg, "sessions": nsess}
+
+
 class _Sess(object):
     __slots__ = ("tok", "src", "final", "text", "segs", "keys", "maps",
                  "playlist", "touched", "error")
@@ -478,6 +600,7 @@ def _sess_put(sess):
             old = sorted(_SESS.values(), key=lambda x: x.touched)[:50]
             for s in old:
                 _SESS.pop(s.tok, None)
+    _ensure_reaper()
 
 
 def _render(sess):
@@ -581,9 +704,19 @@ def _seg_put(key, blob):
         _SEG[key] = (now + SEG_TTL, blob)
         _SEG_BYTES[0] += len(blob)
         if _SEG_BYTES[0] > SEG_MAX_BYTES or len(_SEG) > 4000:
-            for k in sorted(_SEG, key=lambda x: _SEG[x][0])[:max(1, len(_SEG) // 4)]:
+            # 先清过期的，再按到期时间丢最早的一批
+            now2 = time.time()
+            dead = [k for k, item in _SEG.items() if item[0] < now2]
+            for k in dead:
                 _SEG_BYTES[0] -= len(_SEG[k][1])
                 _SEG.pop(k, None)
+            if _SEG_BYTES[0] > SEG_MAX_BYTES or len(_SEG) > 4000:
+                drop = max(1, len(_SEG) // 4)
+                for k in sorted(_SEG, key=lambda x: _SEG[x][0])[:drop]:
+                    _SEG_BYTES[0] -= len(_SEG[k][1])
+                    _SEG.pop(k, None)
+    if len(_SEG) >= 8:
+        _ensure_reaper()
 
 
 def seg_bytes(tok, idx):
@@ -958,10 +1091,16 @@ def unhijack():
         m = 0
     with _LOCK:
         _STATE.update(hijacked=0, routes=[], reason="", mode="")
-    if n or m:
-        log.info("已还原 %d 条 STRM 路由 / 摘掉 %d 个兜底中间件", n, m)
+    # 接管停了就把缓存一起放掉：几 MB 的分片留着没有任何用处
+    try:
+        freed = release()
+    except Exception:                               # noqa: BLE001
+        freed = {}
+    if n or m or freed.get("segments"):
+        log.info("已还原 %d 条路由 / 摘掉 %d 个中间件 / 释放 %d 个分片缓存",
+                 n, m, freed.get("segments", 0))
 
 
 # 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
 # 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
-__version__ = "0.4.2"
+__version__ = "0.4.3"

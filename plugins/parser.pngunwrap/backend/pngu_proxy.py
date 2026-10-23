@@ -74,6 +74,7 @@ class SegmentCache(object):
         self.ttl = max(5, int(ttl))
         self.data = {}          # key -> (bytes, ts)
         self.order = []         # 插入顺序，用于淘汰
+        self.bytes = 0          # 当前占用（增量维护，避免每次求和）
         self.lock = threading.Lock()
 
     def get(self, key):
@@ -91,31 +92,38 @@ class SegmentCache(object):
     def put(self, key, blob):
         now = time.time()
         with self.lock:
+            prev = self.data.get(key)
+            if prev:
+                # 同一个 key 重写要先把旧字节扣掉，否则计数只涨不落
+                self.bytes = max(0, self.bytes - len(prev[0]))
             self.data[key] = (blob, now)
             self.order.append(key)
-            total = sum(len(v[0]) for v in self.data.values())
-            while total > self.max_bytes and self.order:
+            self.bytes += len(blob)
+            # 增量计数，别每次 put 都 O(n) 求和 —— 几千个分片时这是纯浪费 CPU
+            while self.bytes > self.max_bytes and self.order:
                 old = self.order.pop(0)
                 if old == key:
                     continue
                 gone = self.data.pop(old, None)
                 if gone:
-                    total -= len(gone[0])
+                    self.bytes = max(0, self.bytes - len(gone[0]))
 
     def reap(self):
         now = time.time()
         with self.lock:
             dead = [k for k, v in self.data.items() if now - v[1] > self.ttl]
             for k in dead:
-                self.data.pop(k, None)
+                gone = self.data.pop(k, None)
+                if gone:
+                    self.bytes = max(0, self.bytes - len(gone[0]))
             self.order = [k for k in self.order if k in self.data]
 
     def stats(self):
         with self.lock:
-            total = sum(len(v[0]) for v in self.data.values())
             return {"segs": len(self.data),
-                    "bytes": total,
-                    "mb": round(total / 1048576.0, 1)}
+                    "bytes": self.bytes,
+                    "mb": round(self.bytes / 1048576.0, 1),
+                    "max_mb": self.max_bytes // 1048576}
 
 
 class DiagLog(object):
@@ -774,4 +782,4 @@ def find_free_port(host, start):
 
 # 模块自述版本。plugin.py 会拿它和磁盘上的文件比对，不一致就说明平台热更新
 # 只重载了 plugin 模块、子模块还留在 sys.modules 里，需要 importlib.reload。
-__version__ = "0.4.2"
+__version__ = "0.4.3"

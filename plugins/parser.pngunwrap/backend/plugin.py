@@ -472,6 +472,12 @@ class Plugin(BasePlugin):
             pngu_mount.unmount()
         except Exception as e:                      # noqa: BLE001
             log.warning("摘除平台路由失败（不影响运行）：%s", e)
+        try:
+            freed = pngu_hijack.release()
+            log.info("已释放分片缓存：%s 个分片 / %s 个会话",
+                     freed.get("segments"), freed.get("sessions"))
+        except Exception as e:                      # noqa: BLE001
+            log.warning("释放缓存失败（不影响运行）：%s", e)
         self._mount_tried = False
         self._mount_at = 0.0
         proxy, self._proxy = self._proxy, None
@@ -787,6 +793,13 @@ class Plugin(BasePlugin):
             # 没挂上就没有 /api/strm/pngu/seg/... 可指，别去接管内核路由
             return
         log.info("挂到平台 8521 成功：%s", msg)
+        try:
+            # 接管链路自己有一份分片缓存，用界面上的同一组配置
+            pngu_hijack.configure(
+                cache_mb=_as_int(self._cfg.get("cache_mb"), 64, 4, 4096),
+                cache_ttl=_as_int(self._cfg.get("cache_ttl"), 30, 5, 3600))
+        except Exception as e:                      # noqa: BLE001
+            log.info("同步缓存配置失败（忽略）：%s", e)
 
         if not _as_bool(self._cfg.get("hijack_strm"), True):
             log.info("hijack_strm 已关闭，不接管内核 STRM 路由")
